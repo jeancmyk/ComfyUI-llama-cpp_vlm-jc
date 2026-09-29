@@ -267,6 +267,8 @@ class LLAMA_CPP_STORAGE:
         image_max_tokens = config["image_max_tokens"]
         image_min_tokens = config["image_min_tokens"]
         load_mtp = config["load_mtp"]
+        cache_type_k = config.get("cache_type_k", "f16")
+        cache_type_v = config.get("cache_type_v", "f16")
         n_gpu_layers = -1
         
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
@@ -325,6 +327,8 @@ class LLAMA_CPP_STORAGE:
             "n_gpu_layers": n_gpu_layers,
             "n_ctx": n_ctx,
             "verbose": False,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v,
         }
         if "load_mtp" in inspect.signature(Llama.__init__).parameters:
             kwargs["load_mtp"] = load_mtp
@@ -458,7 +462,7 @@ class llama_cpp_model_loader:
             "mmproj": (mmproj_list, {"default": "None"}),
             "chat_handler": (chat_handlers, {"default": "None"}),
             "n_ctx": ("INT", {
-                "default": 8192,
+                "default": 32768,
                 "min": 1024, "max": 327680, "step": 128,
                 "tooltip": "Context length limit."
             }),
@@ -467,9 +471,11 @@ class llama_cpp_model_loader:
                 "min": -1, "max": 1024, "step": 1,
                 "tooltip": "VRAM usage limit in GB (-1 = no limit)\nReference range; actual usage may slightly exceed."
             }),
-            "image_min_tokens": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
-            "image_max_tokens": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 32}),
+            "image_min_tokens": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32}),
+            "image_max_tokens": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32}),
             "load_mtp": ("BOOLEAN", {"default": False}),
+            "cache_type_k": (["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl"], {"default": "f16"}),
+            "cache_type_v": (["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl"], {"default": "f16"}),
             }
         }
 
@@ -478,7 +484,7 @@ class llama_cpp_model_loader:
     FUNCTION = "loadmodel"
     CATEGORY = "llama-cpp-vlm"
 
-    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens, image_max_tokens, load_mtp):
+    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens, image_max_tokens, load_mtp, cache_type_k, cache_type_v):
         custom_config = {
             "model": model,
             "mmproj": mmproj,
@@ -487,7 +493,9 @@ class llama_cpp_model_loader:
             "vram_limit": vram_limit,
             "image_min_tokens": image_min_tokens,
             "image_max_tokens": image_max_tokens,
-            "load_mtp": load_mtp
+            "load_mtp": load_mtp,
+            "cache_type_k": cache_type_k,
+            "cache_type_v": cache_type_v
         }
         if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != custom_config:
             print("[llama-cpp_vlm] Loading model...")
@@ -764,7 +772,7 @@ class llama_cpp_parameters:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "max_tokens": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 1}),
+                "max_tokens": ("INT", {"default": 1024, "min": 0, "max": 32768, "step": 1}),
                 "top_k": ("INT", {"default": 30, "min": 0, "max": 1000, "step": 1}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
