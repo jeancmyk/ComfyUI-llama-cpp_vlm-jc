@@ -7,6 +7,7 @@ import base64
 import random
 import torch
 import inspect
+import wave
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -393,6 +394,66 @@ def image2base64(image):
     img.save(buffered, format="JPEG", quality=85)
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
+def audio2base64(audio):
+    """Encode a ComfyUI AUDIO dict ({"waveform": (B,C,N) tensor, "sample_rate": int})
+    as a base64 16-bit PCM WAV string for llama.cpp input_audio content items."""
+    waveform = audio["waveform"]
+    sample_rate = int(audio["sample_rate"])
+    wav = waveform[0] if waveform.dim() == 3 else waveform
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    pcm = (wav.clamp(-1.0, 1.0) * 32767.0).to(torch.int16).cpu()
+    # (channels, samples) -> interleaved (samples, channels) bytes
+    interleaved = pcm.t().contiguous().numpy().tobytes()
+    buffered = io.BytesIO()
+    with wave.open(buffered, "wb") as f:
+        f.setnchannels(pcm.shape[0])
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        f.writeframes(interleaved)
+    return base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+def video2frames(video):
+    """Decode a ComfyUI VIDEO input (e.g. from the 'Load Video' node) into an
+    IMAGE batch tensor via the core video API."""
+    if not hasattr(video, "get_components"):
+        raise ValueError("Invalid video input: expected a VIDEO from a node such as 'Load Video'.")
+    components = video.get_components()
+    frames = getattr(components, "images", None)
+    if frames is None or frames.shape[0] == 0:
+        raise ValueError("The wired video decoded to no frames.")
+    return frames
+
+_IMAGE_INPUT_RE = re.compile(r"^image_(\d+)$")
+_LEGACY_IMAGE_INPUT = "images"
+
+def _is_image_input(name):
+    return isinstance(name, str) and bool(_IMAGE_INPUT_RE.match(name))
+
+class _DynamicImageInputs:
+    """Optional-input lookup that accepts any numbered image_N slot (and the
+    legacy 'images' batch input) in addition to the explicitly declared ones.
+
+    Only returned when INPUT_TYPES is called from the executor's
+    get_input_info (lazy-graph resolution), so the frontend still shows just
+    the declared slots while dynamically added slots pass validation.
+    (Same pattern as Impact Pack's Switch (Any) / Lora Manager's stack combiner.)
+    """
+    def __init__(self, explicit_inputs):
+        self._explicit_inputs = explicit_inputs
+
+    def __contains__(self, item):
+        if not isinstance(item, str):
+            return False
+        return item in self._explicit_inputs or _is_image_input(item) or item == _LEGACY_IMAGE_INPUT
+
+    def __getitem__(self, key):
+        if key in self._explicit_inputs:
+            return self._explicit_inputs[key]
+        if _is_image_input(key) or key == _LEGACY_IMAGE_INPUT:
+            return ("IMAGE", {"tooltip": "Image input. Connect to add more inputs (max 9)."})
+        raise KeyError(key)
+
 def parse_json(json_str):
     json_output = json_str.strip()
     if json_output.startswith("```json"):
@@ -525,6 +586,28 @@ class llama_cpp_model_loader:
 class llama_cpp_instruct_adv:
     @classmethod
     def INPUT_TYPES(s):
+        optional_inputs = {
+            "parameters": ("LLAMACPPARAMS",),
+            # Native dynamic-slot spec (COMFY_AUTOGROW_V3): the frontend grows
+            # image_1..image_9 slots from this template, starting with 2 slots.
+            # Same wire format the V3 io.Autogrow API emits (see comfy_extras/nodes_boogu.py).
+            "images": ("COMFY_AUTOGROW_V3", {
+                "tooltip": "Image inputs. Connect to add more inputs (max 9).",
+                "template": {
+                    "input": {"required": {"image": ("IMAGE", {})}},
+                    "names": [f"image_{i}" for i in range(1, 10)],
+                    "min": 2,
+                },
+            }),
+            "video": ("VIDEO", {"tooltip": "Video input (e.g. from 'Load Video'). Frames are sampled like an image batch."}),
+            "audio": ("AUDIO", {"tooltip": "Audio input (e.g. from 'Load Audio'). Requires an audio-capable model such as Qwen3-ASR."}),
+            "queue_handler": (any_type, {"tooltip": "Used to control the execution order of instruct nodes."}),
+        }
+        stack = inspect.stack()
+        if len(stack) > 2 and stack[2].function == "get_input_info":
+            # Bypass executor validation for dynamically added image_N slots
+            optional_inputs = _DynamicImageInputs(optional_inputs)
+
         return {
             "required": {
                 "llama_model": ("LLAMACPPMODEL",),
@@ -574,11 +657,7 @@ class llama_cpp_instruct_adv:
             "hidden": {
                 "unique_id": "UNIQUE_ID",
             },
-            "optional": {
-                "parameters": ("LLAMACPPARAMS",),
-                "images": ("IMAGE",),
-                "queue_handler": (any_type, {"tooltip": "Used to control the execution order of instruct nodes."}),
-            },
+            "optional": optional_inputs,
         }
     
     RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING")
@@ -616,9 +695,14 @@ class llama_cpp_instruct_adv:
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "image_url":
                         item["image_url"]["url"] = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAADElEQVQImWP4//8/AAX+Av5Y8msOAAAAAElFTkSuQmCC"
+                    elif isinstance(item, dict) and item.get("type") == "input_audio":
+                        # 0-sample WAV header placeholder, keeps saved states small
+                        item["input_audio"] = {"data": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YQAAAAA=", "format": "wav"}
+                    elif isinstance(item, dict) and item.get("type") == "audio_url":
+                        item["audio_url"] = {"url": "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YQAAAAA="}
         return clean_messages
     
-    def process(self, llama_model, preset_prompt, custom_prompt, system_prompt, reasoning_handling, custom_reasoning_tags, inference_mode, max_frames, max_size, seed, force_offload, save_states, unique_id, parameters=None, images=None, queue_handler=None):
+    def process(self, llama_model, preset_prompt, custom_prompt, system_prompt, reasoning_handling, custom_reasoning_tags, inference_mode, max_frames, max_size, seed, force_offload, save_states, unique_id, parameters=None, images=None, video=None, audio=None, image_1=None, image_2=None, queue_handler=None, **kwargs):
         # 解包 INPUT_IS_LIST 参数
         llama_model = llama_model[0] if isinstance(llama_model, list) else llama_model
         preset_prompt = preset_prompt[0] if isinstance(preset_prompt, list) else preset_prompt
@@ -634,6 +718,8 @@ class llama_cpp_instruct_adv:
         save_states = save_states[0] if isinstance(save_states, list) else save_states
         unique_id = unique_id[0] if isinstance(unique_id, list) else unique_id
         parameters = parameters[0] if isinstance(parameters, list) and parameters else parameters
+        video = video[0] if isinstance(video, list) and video else (None if isinstance(video, list) else video)
+        audio = audio[0] if isinstance(audio, list) and audio else (None if isinstance(audio, list) else audio)
 
         if not LLAMA_CPP_STORAGE.llm:
             LLAMA_CPP_STORAGE.load_model(llama_model)
@@ -681,9 +767,57 @@ class llama_cpp_instruct_adv:
             p = preset_prompts[preset_prompt].replace("#", custom_prompt.strip()).replace("@", "video" if video_input else "image")
             user_content.append({"type": "text", "text": p})
             
-        # 过滤并按 list 里的每个 item 整理图片（保持 list 的每个 item 独立性）
-        raw_image_list = [img for img in images if img is not None] if images is not None else []
-        
+        # 整理图片输入：动态插槽 image_1..image_9（按序号排序）+ 旧版批量 images + video
+        # - 只携带单个元素的插槽合并进同一个共享 item（等效于 batch 到一起，允许不同尺寸）
+        # - 携带多元素 list 的插槽（上游 OUTPUT_IS_LIST 节点）保持每个元素独立 item
+        slot_values = {}
+        for key, value in kwargs.items():
+            match = _IMAGE_INPUT_RE.match(key)
+            if match and value is not None:
+                slot_values[int(match.group(1))] = value
+        if image_1 is not None:
+            slot_values[1] = image_1
+        if image_2 is not None:
+            slot_values[2] = image_2
+
+        def _slot_items(value):
+            items = value if isinstance(value, list) else [value]
+            return [item for item in items if item is not None]
+
+        combined_frames = []   # 单元素插槽合并成的共享 item（帧列表，允许不同尺寸）
+        separate_items = []    # 多元素 list 插槽的独立 item
+        for slot in sorted(slot_values):
+            items = _slot_items(slot_values[slot])
+            if len(items) > 1:
+                separate_items.extend(items)
+            else:
+                combined_frames.extend(items)
+
+        raw_image_list = []
+        if combined_frames:
+            raw_image_list.append(combined_frames)
+        raw_image_list.extend(separate_items)
+        if images is not None:
+            # 旧版工作流兼容：批量 images 输入的每个 list item 保持独立
+            raw_image_list.extend(_slot_items(images))
+
+        # VIDEO 输入：解码为帧批次，作为一个独立 item 追加（"video" 推理模式下按 max_frames 抽帧）
+        if video is not None:
+            raw_image_list.append(video2frames(video))
+
+        # AUDIO 输入：编码为 base64 WAV，附加到用户消息
+        # （one by one / video 模式会随 user_content 一起深拷贝到每个 item）
+        audio_content_items = []
+        if audio is not None:
+            chat_handler = LLAMA_CPP_STORAGE.chat_handler
+            if chat_handler is None or not getattr(chat_handler, "is_support_audio", False):
+                raise ValueError("Audio input detected, but the loaded model is not configured with an audio-capable mmproj module (e.g. Qwen3-ASR).")
+            audio_content_items.append({
+                "type": "input_audio",
+                "input_audio": {"data": audio2base64(audio), "format": "wav"}
+            })
+        user_content.extend(audio_content_items)
+
         if raw_image_list:
             curr_mmproj = LLAMA_CPP_STORAGE.current_config.get("mmproj") if LLAMA_CPP_STORAGE.current_config else None
             if LLAMA_CPP_STORAGE.chat_handler is None or curr_mmproj in [None, "None"]:
@@ -692,7 +826,17 @@ class llama_cpp_instruct_adv:
             # image_groups[i] 对应输入 list 里的第 i 个 item (可能包含单帧或 Batch 多帧)
             image_groups = []
             for img_item in raw_image_list:
-                if img_item.ndim == 3:
+                if isinstance(img_item, (list, tuple)):
+                    # 合并插槽得到的共享 item：展开其中所有帧（允许不同尺寸）
+                    group = []
+                    for frame in img_item:
+                        if frame.ndim == 3:
+                            group.append(frame)
+                        elif frame.ndim == 4:
+                            group.extend(frame[i] for i in range(frame.shape[0]))
+                    if group:
+                        image_groups.append(group)
+                elif img_item.ndim == 3:
                     image_groups.append([img_item])
                 elif img_item.ndim == 4:
                     image_groups.append([img_item[i] for i in range(img_item.shape[0])])
@@ -788,6 +932,17 @@ class llama_cpp_instruct_adv:
                     
                 out1 = "\n\n".join(tmp_list)
                 messages.append({"role": "user", "content": user_content})
+        elif audio_content_items:
+            # 纯音频模式（无图片/视频输入）：单次推理
+            print("[llama-cpp_vlm] [Audio Mode] Processing audio input...")
+            messages.append({"role": "user", "content": user_content})
+            output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
+            raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
+
+            out1, reasoning = self._handle_reasoning(raw_text, reasoning_handling, custom_reasoning_tags)
+            out2 = [out1]
+            reasoning_list.append(reasoning)
+
         else:
             # 纯文本模式
             text_string = "".join([item["text"] for item in user_content if item.get("type") == "text"])
