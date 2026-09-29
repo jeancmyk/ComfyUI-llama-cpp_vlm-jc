@@ -14,6 +14,9 @@ from scipy.ndimage import gaussian_filter
 from .support.cqdm import cqdm
 from .support.gguf_layers import get_layer_count
 from .support.prompt_enhancer_preset import *
+from .support.reasoning import (
+    ReasoningSpec, GENERIC_SPEC, resolve_reasoning_spec, parse_custom_tags, split_reasoning
+)
 
 import folder_paths
 import comfy.model_management as mm
@@ -125,6 +128,7 @@ class LLAMA_CPP_STORAGE:
     chat_handler = None
     current_config = None
     current_embedding_mode = False
+    reasoning_spec = None
     messages = {}
     sys_prompts = {}
     
@@ -198,6 +202,7 @@ class LLAMA_CPP_STORAGE:
         cls.llm = None
         cls.chat_handler = None
         cls.current_config = None
+        cls.reasoning_spec = None
         if all:
             cls.clean_state()
         
@@ -337,6 +342,21 @@ class LLAMA_CPP_STORAGE:
                 raise RuntimeError('"load_mtp" is unavailable! Please upgrade your llama-cpp-python.')
             
         cls.llm = Llama(**kwargs)
+
+        # Resolve how this model delimits its reasoning (thinking) content:
+        # handler preset first, then GGUF chat-template auto-detection.
+        template = None
+        try:
+            template = (getattr(cls.llm, "metadata", None) or {}).get("tokenizer.chat_template", None)
+        except Exception:
+            template = None
+        cls.reasoning_spec = resolve_reasoning_spec(chat_handler, model_path, template)
+        if cls.reasoning_spec is not None:
+            print(f"[llama-cpp_vlm] Reasoning parsing: {cls.reasoning_spec.name} "
+                  f"(start={cls.reasoning_spec.start_tag!r}, end={cls.reasoning_spec.end_tag!r}, "
+                  f"start_in_prompt={cls.reasoning_spec.start_in_prompt})")
+        else:
+            print("[llama-cpp_vlm] Reasoning parsing: no reasoning markers detected")
 
 any_type = AnyType("*")
 
@@ -511,6 +531,18 @@ class llama_cpp_instruct_adv:
                 "preset_prompt": (preset_tags, {"default": preset_tags[1]}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": 'user_prompt\n\nFor preset hints marked with an "*", this will be used to fill the placeholder (e.g., Object names in BBox detection)\nOtherwise, this will override the preset prompts.'}),
                 "system_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "reasoning_handling": (["auto", "strip", "keep", "custom tags"], {
+                    "default": "auto",
+                    "tooltip": "How to treat reasoning (thinking) content in the model output.\n"
+                               "auto: use the reasoning format detected from the loader's model type / GGUF chat template, split it into the 'reasoning' output\n"
+                               "strip: remove reasoning content silently\n"
+                               "keep: leave the output untouched\n"
+                               "custom tags: split using the tags given in custom_reasoning_tags"
+                }),
+                "custom_reasoning_tags": ("STRING", {
+                    "default": "", "multiline": False,
+                    "placeholder": "e.g. <seed:think>,</seed:think> (only for 'custom tags' mode)"
+                }),
                 "inference_mode": (["one by one", "images", "video"], {
                     "default": "one by one",
                     "tooltip": "one by one: Process each item in the input list one by one (multi-image batch inside an item will be inferred together)\nimages:  \tCombine ALL images across all list items into 1 single prompt\nvideo:  \tTreat each image item in the list as a separate video clip"
@@ -549,13 +581,33 @@ class llama_cpp_instruct_adv:
             },
         }
     
-    RETURN_TYPES = ("STRING", "STRING", "INT")
-    RETURN_NAMES = ("output", "output_list", "state_uid")
-    OUTPUT_IS_LIST = (False, True, False)
+    RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING")
+    RETURN_NAMES = ("output", "output_list", "state_uid", "reasoning", "reasoning_list")
+    OUTPUT_IS_LIST = (False, True, False, False, True)
     INPUT_IS_LIST = True  # 开启 LIST 支持
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
-    
+
+    def _active_reasoning_spec(self, mode, custom_reasoning_tags):
+        """Pick the ReasoningSpec for this run (node override > loader detection > generic)."""
+        if mode == "custom tags":
+            spec = parse_custom_tags(custom_reasoning_tags)
+            if spec is None:
+                raise ValueError('"custom tags" reasoning mode selected, but custom_reasoning_tags is empty.')
+            return spec
+        return LLAMA_CPP_STORAGE.reasoning_spec or GENERIC_SPEC
+
+    def _handle_reasoning(self, text, mode, custom_reasoning_tags):
+        """Split raw model output -> (content, reasoning) per the chosen mode."""
+        if mode == "keep":
+            return text, ""
+        spec = self._active_reasoning_spec(mode, custom_reasoning_tags)
+        reasoning, content = split_reasoning(text, spec)
+        if mode == "strip":
+            return content, ""
+        # "auto" and "custom tags" both surface the reasoning content
+        return content, reasoning
+
     def sanitize_messages(self, messages):
         clean_messages = json.loads(json.dumps(messages))
         for msg in clean_messages:
@@ -566,12 +618,14 @@ class llama_cpp_instruct_adv:
                         item["image_url"]["url"] = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAADElEQVQImWP4//8/AAX+Av5Y8msOAAAAAElFTkSuQmCC"
         return clean_messages
     
-    def process(self, llama_model, preset_prompt, custom_prompt, system_prompt, inference_mode, max_frames, max_size, seed, force_offload, save_states, unique_id, parameters=None, images=None, queue_handler=None):
+    def process(self, llama_model, preset_prompt, custom_prompt, system_prompt, reasoning_handling, custom_reasoning_tags, inference_mode, max_frames, max_size, seed, force_offload, save_states, unique_id, parameters=None, images=None, queue_handler=None):
         # 解包 INPUT_IS_LIST 参数
         llama_model = llama_model[0] if isinstance(llama_model, list) else llama_model
         preset_prompt = preset_prompt[0] if isinstance(preset_prompt, list) else preset_prompt
         custom_prompt = custom_prompt[0] if isinstance(custom_prompt, list) else custom_prompt
         system_prompt = system_prompt[0] if isinstance(system_prompt, list) else system_prompt
+        reasoning_handling = reasoning_handling[0] if isinstance(reasoning_handling, list) else reasoning_handling
+        custom_reasoning_tags = custom_reasoning_tags[0] if isinstance(custom_reasoning_tags, list) else custom_reasoning_tags
         inference_mode = inference_mode[0] if isinstance(inference_mode, list) else inference_mode
         max_frames = max_frames[0] if isinstance(max_frames, list) else max_frames
         max_size = max_size[0] if isinstance(max_size, list) else max_size
@@ -619,6 +673,7 @@ class llama_cpp_instruct_adv:
                 
         out1 = ""
         out2 = []
+        reasoning_list = []
         user_content = []
         if custom_prompt.strip() and "*" not in preset_prompt:
             user_content.append({"type": "text", "text": custom_prompt})
@@ -666,8 +721,10 @@ class llama_cpp_instruct_adv:
                     curr_messages = messages + [{"role": "user", "content": curr_user_content}]
                     output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=curr_messages, seed=seed, **_parameters)
                     text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                    
+                    text, reasoning = self._handle_reasoning(text, reasoning_handling, custom_reasoning_tags)
+
                     out2.append(text)
+                    reasoning_list.append(reasoning)
                     if len(image_groups) > 1:
                         tmp_list.append(f"====== Item {item_idx+1} ======")
                     tmp_list.append(text)
@@ -693,12 +750,10 @@ class llama_cpp_instruct_adv:
                 messages.append({"role": "user", "content": user_content})
                 output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
                 raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                
-                # 使用正则剔除 <think>...</think> 及其包含的所有内容
-                clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_text, flags=re.DOTALL).strip()
-                
-                out1 = clean_text
+
+                out1, reasoning = self._handle_reasoning(raw_text, reasoning_handling, custom_reasoning_tags)
                 out2 = [out1]
+                reasoning_list.append(reasoning)
                 
             # 3. VIDEO 模式：把 list 里的每个 item 各自当成一个视频独立推理
             elif inference_mode == "video":
@@ -723,8 +778,10 @@ class llama_cpp_instruct_adv:
                     curr_messages = messages + [{"role": "user", "content": curr_user_content}]
                     output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=curr_messages, seed=seed, **_parameters)
                     text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-                    
+                    text, reasoning = self._handle_reasoning(text, reasoning_handling, custom_reasoning_tags)
+
                     out2.append(text)
+                    reasoning_list.append(reasoning)
                     if len(image_groups) > 1:
                         tmp_list.append(f"====== Video Clip {v_idx+1} ======")
                     tmp_list.append(text)
@@ -737,12 +794,10 @@ class llama_cpp_instruct_adv:
             messages.append({"role": "user", "content": text_string})
             output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
             raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
-            
-            # 使用正则剔除 <think>...</think> 及其包含的所有内容
-            clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', raw_text, flags=re.DOTALL).strip()
-            
-            out1 = clean_text
+
+            out1, reasoning = self._handle_reasoning(raw_text, reasoning_handling, custom_reasoning_tags)
             out2 = [out1]
+            reasoning_list.append(reasoning)
             
         if save_states:
             print(f"[llama-cpp_vlm] Saving state id={uid}...")
@@ -763,9 +818,11 @@ class llama_cpp_instruct_adv:
                 if LLAMA_CPP_STORAGE.llm.is_hybrid and LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr is not None:
                     LLAMA_CPP_STORAGE.llm._hybrid_cache_mgr.clear()
                     
+        reasoning_out = "\n\n".join(r for r in reasoning_list if r)
+
         del messages
         gc.collect()
-        return (out1, out2, uid)
+        return (out1, out2, uid, reasoning_out, reasoning_list)
 
 class llama_cpp_parameters:
     @classmethod
