@@ -424,7 +424,9 @@ def video2frames(video):
         raise ValueError("The wired video decoded to no frames.")
     return frames
 
-_IMAGE_INPUT_RE = re.compile(r"^image_(\d+)$")
+# Autogrow slots arrive with the group prefix from the frontend, e.g.
+# "images.image_1"; accept both the prefixed and bare forms.
+_IMAGE_INPUT_RE = re.compile(r"^(?:images\.)?image_(\d+)$")
 _LEGACY_IMAGE_INPUT = "images"
 
 def _is_image_input(name):
@@ -775,6 +777,8 @@ class llama_cpp_instruct_adv:
             match = _IMAGE_INPUT_RE.match(key)
             if match and value is not None:
                 slot_values[int(match.group(1))] = value
+        # Autogrow slots are keyed "images.image_N" by the frontend; the bare
+        # image_1/image_2 params above only cover legacy/renamed workflows.
         if image_1 is not None:
             slot_values[1] = image_1
         if image_2 is not None:
