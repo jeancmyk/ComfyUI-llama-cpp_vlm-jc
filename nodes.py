@@ -777,6 +777,14 @@ class llama_cpp_instruct_adv:
             match = _IMAGE_INPUT_RE.match(key)
             if match and value is not None:
                 slot_values[int(match.group(1))] = value
+        # TEMP DEBUG: dump what the executor actually passed for image inputs
+        try:
+            print(f"[llama-cpp_vlm][debug] kwargs_keys={sorted(kwargs.keys())} "
+                  f"images_arg={type(images).__name__ if images is not None else None} "
+                  f"image_1={'set' if image_1 is not None else None} image_2={'set' if image_2 is not None else None} "
+                  f"slot_values={sorted(slot_values.keys())}")
+        except Exception:
+            pass
         # Autogrow slots are keyed "images.image_N" by the frontend; the bare
         # image_1/image_2 params above only cover legacy/renamed workflows.
         if image_1 is not None:
