@@ -7,13 +7,17 @@ import base64
 import random
 import torch
 import inspect
+import time
 import wave
+import threading
 
 import numpy as np
 from PIL import Image, ImageDraw
 from scipy.ndimage import gaussian_filter
 from .support.cqdm import cqdm
-from .support.gguf_layers import get_layer_count
+from .support.gguf_layers import get_layer_count, get_model_info
+from .support.vram import estimate_kv_cache, fmt_gib, GIB
+from .support.inference_stats import InferenceStats
 from .support.prompt_enhancer_preset import *
 from .support.reasoning import (
     ReasoningSpec, GENERIC_SPEC, resolve_reasoning_spec, parse_custom_tags, split_reasoning
@@ -264,67 +268,193 @@ class LLAMA_CPP_STORAGE:
                     raise ValueError(f'Unknown model type: "{chat_handler}"')
         
         cls.clean(all=True)
+        InferenceStats.reset()
         cls.current_config = config.copy()
         model = config["model"]
         mmproj = config["mmproj"]
+        skip_mmproj = config.get("skip_mmproj", False)
+        mmproj_effective = "None" if skip_mmproj else mmproj
         chat_handler = config["chat_handler"]
         n_ctx = config["n_ctx"]
         vram_limit = config["vram_limit"]
         image_max_tokens = config["image_max_tokens"]
         image_min_tokens = config["image_min_tokens"]
-        load_mtp = config["load_mtp"]
+        load_mtp = config.get("load_mtp", False)
+        free_vram = config.get("free_vram", True)
+        enforce_vram = config.get("enforce_vram", False)
         cache_type_k = config.get("cache_type_k", "f16")
         cache_type_v = config.get("cache_type_v", "f16")
         n_gpu_layers = -1
-        
+
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
         handler_cls = get_chat_handler(chat_handler)
-        
+
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"Model not found: {model_path}")
+
+        # GGUF metadata drives the KV-cache estimate and the MTP report.
+        model_info = get_model_info(model_path) if model_path.lower().endswith(".gguf") else {}
+        gguf_layers = int(model_info.get("layer_count") or 0) or get_layer_count(model_path) or 32
+        checkpoint_bytes = os.path.getsize(model_path)
+
         if vram_limit != -1:
-            gguf_layers = get_layer_count(model_path) or 32
-            gguf_size = os.path.getsize(model_path) * 1.55 / (1024 ** 3)
+            # Keep the loader's existing conservative layer-placement scale;
+            # the fit report below uses the actual file size instead.
+            gguf_size = checkpoint_bytes * 1.55 / GIB
             gguf_layer_size = gguf_size / gguf_layers
-        
-        if mmproj and mmproj != "None":
-            mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj)
+
+        mmproj_path = None
+        mmproj_bytes = 0
+        if mmproj_effective and mmproj_effective != "None":
+            mmproj_path = os.path.join(folder_paths.models_dir, 'LLM', mmproj_effective)
+            if not os.path.isfile(mmproj_path):
+                raise FileNotFoundError(f"mmproj not found: {mmproj_path}")
             if chat_handler == "None":
                 raise ValueError('"chat_handler" cannot be None when mmproj is used!')
-            
+
             if handler_cls is None:
                 raise RuntimeError(f"Chat handler '{chat_handler}' is not available or failed to import.")
 
+            mmproj_bytes = os.path.getsize(mmproj_path)
             if vram_limit != -1:
-                mmproj_size = os.path.getsize(mmproj_path) * 1.55 / (1024 ** 3)
+                mmproj_size = mmproj_bytes * 1.55 / GIB
                 n_gpu_layers = max(1, int((vram_limit - mmproj_size) / gguf_layer_size))
-            
+        else:
+            if vram_limit != -1:
+                n_gpu_layers = max(1, int(vram_limit / gguf_layer_size))
+
+        kv_cache = estimate_kv_cache(model_info, n_ctx, cache_type_k, cache_type_v)
+        kv_bytes = kv_cache["bytes"]
+
+        effective_layers = gguf_layers if n_gpu_layers < 0 else min(n_gpu_layers, gguf_layers)
+        offload_fraction = 1.0 if n_gpu_layers < 0 else min(1.0, effective_layers / gguf_layers)
+        weights_bytes = checkpoint_bytes * offload_fraction
+        total_est_bytes = weights_bytes + kv_bytes + mmproj_bytes
+
+        print("[llama-cpp_vlm] ===== Model load =====")
+        print(f"[llama-cpp_vlm] checkpoint: {model} "
+              f"({fmt_gib(checkpoint_bytes)}, {gguf_layers} layers)")
+        if mmproj_path:
+            print(f"[llama-cpp_vlm] mmproj: {mmproj_effective} ({fmt_gib(mmproj_bytes)})")
+        elif skip_mmproj and mmproj not in (None, "None"):
+            print(f"[llama-cpp_vlm] mmproj: {mmproj} (skipped by skip_mmproj toggle)")
+        else:
+            print("[llama-cpp_vlm] mmproj: None (text-only)")
+        print(
+            f"[llama-cpp_vlm] KV cache estimate: {fmt_gib(kv_bytes)} "
+            f"(n_ctx={n_ctx}, k={cache_type_k}, v={cache_type_v}, "
+            f"{gguf_layers} layers, ~{kv_cache['bytes_per_token'] / 1024:.1f} KiB/token)"
+        )
+
+        mtp_supported = "load_mtp" in inspect.signature(Llama.__init__).parameters
+        mtp_nextn = int(model_info.get("nextn_predict_layers") or 0)
+        if load_mtp and not mtp_supported:
+            raise RuntimeError('"load_mtp" is unavailable! Please upgrade your llama-cpp-python.')
+        if not mtp_supported:
+            print("[llama-cpp_vlm] MTP: unavailable in this llama-cpp-python build (no load_mtp)")
+        elif not load_mtp:
+            extra = f"; model has {mtp_nextn} nextn layer(s)" if mtp_nextn else ""
+            print(f"[llama-cpp_vlm] MTP: not requested{extra}")
+        else:
+            extra = (f"; model has {mtp_nextn} nextn layer(s)" if mtp_nextn
+                     else "; model reports no nextn layers")
+            print(f"[llama-cpp_vlm] MTP: requested{extra}")
+
+        if vram_limit == -1:
+            print(
+                f"[llama-cpp_vlm] VRAM limit: none (-1) | estimate {fmt_gib(total_est_bytes)} "
+                f"(enforce_vram ignored)"
+            )
+        else:
+            limit_bytes = vram_limit * GIB
+            fits = total_est_bytes <= limit_bytes
+            headroom_gb = (limit_bytes - total_est_bytes) / GIB
+            print(
+                f"[llama-cpp_vlm] VRAM estimate: weights {fmt_gib(weights_bytes)} "
+                f"({effective_layers}/{gguf_layers} layers) + KV {fmt_gib(kv_bytes)} + "
+                f"mmproj {fmt_gib(mmproj_bytes)} = {fmt_gib(total_est_bytes)} / "
+                f"{vram_limit} GB -> {'FITS' if fits else 'OVER'} ({headroom_gb:+.2f} GB)"
+            )
+
+            if enforce_vram and not fits:
+                # Enforce the cap by moving layers back to system RAM instead
+                # of letting the allocation spill or fail.
+                available = limit_bytes - kv_bytes - mmproj_bytes
+                per_layer_bytes = checkpoint_bytes / gguf_layers if gguf_layers else 0
+                fit_layers = int(available / per_layer_bytes) if per_layer_bytes > 0 else 0
+                fit_layers = max(0, min(fit_layers, gguf_layers))
+                if fit_layers < 1:
+                    raise RuntimeError(
+                        "enforce_vram: checkpoint + KV cache + mmproj do not fit in "
+                        f"vram_limit={vram_limit} GB. KV cache alone needs {fmt_gib(kv_bytes)}, "
+                        f"mmproj {fmt_gib(mmproj_bytes)}. Lower n_ctx, quantize the KV cache "
+                        "(cache_type_k/v), raise vram_limit, or disable enforce_vram."
+                    )
+                print(
+                    f"[llama-cpp_vlm] enforce_vram: offloading "
+                    f"{effective_layers - fit_layers} layer(s) to system RAM "
+                    f"({effective_layers} -> {fit_layers} GPU layers)"
+                )
+                n_gpu_layers = fit_layers
+                effective_layers = fit_layers
+                weights_bytes = checkpoint_bytes * (fit_layers / gguf_layers)
+                total_est_bytes = weights_bytes + kv_bytes + mmproj_bytes
+                print(
+                    f"[llama-cpp_vlm] VRAM estimate after enforce: weights "
+                    f"{fmt_gib(weights_bytes)} ({fit_layers}/{gguf_layers} layers) + KV "
+                    f"{fmt_gib(kv_bytes)} + mmproj {fmt_gib(mmproj_bytes)} = "
+                    f"{fmt_gib(total_est_bytes)} / {vram_limit} GB"
+                )
+
+        free_after = _free_vram_before_load(total_est_bytes, free_vram)
+        if free_after is not None and total_est_bytes > free_after:
+            problem = (
+                f"estimated load ({fmt_gib(total_est_bytes)}) exceeds free VRAM "
+                f"after cleanup ({free_after / GIB:.2f} GB). Close other GPU apps, "
+                "lower n_ctx, quantize the KV cache, or raise vram_limit."
+            )
+            if enforce_vram and vram_limit != -1:
+                raise RuntimeError("enforce_vram: " + problem)
+            print(f"[llama-cpp_vlm] WARNING: {problem}")
+
+        # The vision/audio handler is created only after the VRAM plan is set.
+        if mmproj_path:
             print(f"[llama-cpp_vlm] Loading clip: {mmproj}")
-            
+
             think_mode = "Thinking" in chat_handler
-            kwargs = {"clip_model_path": mmproj_path, "verbose": False}
+            handler_kwargs = {"clip_model_path": mmproj_path, "verbose": False}
             if chat_handler in ["Qwen3-VL", "Qwen3-VL-Thinking"]:
-                kwargs["force_reasoning"] = think_mode
-                kwargs["image_max_tokens"] = image_max_tokens
-                kwargs["image_min_tokens"] = image_min_tokens
+                handler_kwargs["force_reasoning"] = think_mode
+                handler_kwargs["image_max_tokens"] = image_max_tokens
+                handler_kwargs["image_min_tokens"] = image_min_tokens
             elif any(x in chat_handler for x in ["GLM-4.6V", "MiniCPM-v4.5", "MiniCPM-v4.6", "Qwen3.5", "Qwen3.6", "Qwen3.8"]):
-                kwargs["enable_thinking"] = think_mode
+                handler_kwargs["enable_thinking"] = think_mode
 
             if _MTMD:
-                kwargs["image_max_tokens"] = image_max_tokens
-                kwargs["image_min_tokens"] = image_min_tokens
+                handler_kwargs["image_max_tokens"] = image_max_tokens
+                handler_kwargs["image_min_tokens"] = image_min_tokens
 
             try:
-                cls.chat_handler = handler_cls(**kwargs)
+                cls.chat_handler = handler_cls(**handler_kwargs)
             except Exception as e:
                 raise RuntimeError(f"{e}\nPlease update llama-cpp-python from 'https://github.com/JamePeng/llama-cpp-python/releases'")
 
         else:
-            if vram_limit != -1:
-                n_gpu_layers = max(1, int(vram_limit / gguf_layer_size))
             if handler_cls is not None:
-                cls.chat_handler = handler_cls(verbose=False)
+                try:
+                    cls.chat_handler = handler_cls(verbose=False)
+                except Exception as e:
+                    # Some VLM handlers require a clip at construction time;
+                    # without an mmproj (or with skip_mmproj on) fall back to
+                    # plain text instead of failing the load.
+                    print(
+                        f"[llama-cpp_vlm] Chat handler '{chat_handler}' cannot be "
+                        f"created without an mmproj; continuing text-only ({e})"
+                    )
+                    cls.chat_handler = None
             else:
                 cls.chat_handler = None
-        
+
         print(f"[llama-cpp_vlm] Loading model: {model}")
         print(f"[llama-cpp_vlm] n_gpu_layers = {n_gpu_layers}")
         kwargs = {
@@ -336,13 +466,48 @@ class LLAMA_CPP_STORAGE:
             "cache_type_k": cache_type_k,
             "cache_type_v": cache_type_v,
         }
-        if "load_mtp" in inspect.signature(Llama.__init__).parameters:
+        if mtp_supported:
             kwargs["load_mtp"] = load_mtp
-        else:
-            if load_mtp:
-                raise RuntimeError('"load_mtp" is unavailable! Please upgrade your llama-cpp-python.')
-            
+
+        load_start = time.perf_counter()
         cls.llm = Llama(**kwargs)
+        load_s = time.perf_counter() - load_start
+
+        # Authoritative post-load figures (the pre-load numbers are estimates).
+        try:
+            actual_model = llama_cpp.llama_model_size(cls.llm.model)
+            actual_state = llama_cpp.llama_state_get_size(cls.llm.ctx)
+            print(
+                f"[llama-cpp_vlm] Loaded in {load_s:.2f}s | actual model "
+                f"{fmt_gib(actual_model)} | actual state/KV {fmt_gib(actual_state)}"
+            )
+        except Exception as e:
+            print(f"[llama-cpp_vlm] Loaded in {load_s:.2f}s "
+                  f"(actual sizes unavailable: {e})")
+
+        if load_mtp and mtp_supported:
+            try:
+                active_nextn = int(cls.llm.n_layer_nextn())
+                nextn_probe_ok = True
+            except Exception:
+                active_nextn = 0
+                nextn_probe_ok = False
+            if active_nextn > 0:
+                print(f"[llama-cpp_vlm] MTP: loaded/active ({active_nextn} nextn layer(s))")
+            elif nextn_probe_ok:
+                print("[llama-cpp_vlm] MTP: requested but no nextn layer is active")
+            else:
+                print(
+                    "[llama-cpp_vlm] MTP: load requested; active nextn layers unverified "
+                    f"(GGUF metadata reports {mtp_nextn})"
+                )
+
+        if mmproj_path:
+            print(f"[llama-cpp_vlm] mmproj: loaded ({mmproj_effective})")
+        elif skip_mmproj and mmproj not in (None, "None"):
+            print(f"[llama-cpp_vlm] mmproj: skipped by toggle ({mmproj})")
+        else:
+            print("[llama-cpp_vlm] mmproj: skipped")
 
         # Resolve how this model delimits its reasoning (thinking) content:
         # handler preset first, then GGUF chat-template auto-detection.
@@ -358,6 +523,147 @@ class LLAMA_CPP_STORAGE:
                   f"start_in_prompt={cls.reasoning_spec.start_in_prompt})")
         else:
             print("[llama-cpp_vlm] Reasoning parsing: no reasoning markers detected")
+
+class _LlamaCancelBridge:
+    """Make ComfyUI's cancel button reach llama.cpp generation.
+
+    Why the node used to hang
+    -------------------------
+    ``create_chat_completion`` is a single blocking call that generates every
+    token internally. The node only polled ``mm.processing_interrupted()``
+    *between* list items, so a cancel pressed while one completion was running
+    was never observed: the process kept decoding to ``max_tokens`` and the
+    queue item never finished.
+
+    How this works
+    --------------
+    A watchdog thread runs only while a completion is in flight and polls
+    ComfyUI's interrupt flag. On cancel it calls ``llm.abort()``, which only
+    sets the thread-safe event llama.cpp already checks in its sampling loop
+    (``Llama.generate``/``_create_completion``) -- so decoding stops within
+    about one token instead of running to the end, with no unsafe callbacks
+    into Python from native code.
+
+    ``llm.abort()``'s event is cleared at the start of every completion, so a
+    cancel can never leak into a later run; the bridge is reset on entry too.
+    """
+
+    POLL_INTERVAL = 0.05  # seconds
+
+    def __init__(self, label=""):
+        self.label = label
+        self._cancelled = threading.Event()
+        self._done = threading.Event()
+        self._thread = None
+
+    # -- public API -------------------------------------------------------
+    def __enter__(self):
+        self._cancelled.clear()
+        self._done.clear()
+        self._thread = threading.Thread(
+            target=self._watch, name="llama-cpp-cancel", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._done.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+        if isinstance(exc, mm.InterruptProcessingException):
+            mm.interrupt_current_processing(False)
+            return False
+        if self._cancelled.is_set():
+            # Cancelled: swallow whichever error the abort surfaced and tell
+            # ComfyUI this node was interrupted (history shows "interrupted"
+            # instead of a scary decode exception).
+            mm.interrupt_current_processing(False)
+            print(f"[llama-cpp_vlm] Generation cancelled ({self.label}).")
+            raise mm.InterruptProcessingException() from exc
+        return False
+
+    @classmethod
+    def check(cls):
+        """Between-item / between-stage cancel check that always raises."""
+        if mm.processing_interrupted():
+            # Match ComfyUI's own semantics: consume the flag, then raise.
+            mm.interrupt_current_processing(False)
+            print("[llama-cpp_vlm] Generation cancelled.")
+            raise mm.InterruptProcessingException()
+
+    # -- internals --------------------------------------------------------
+    def _watch(self):
+        llm = LLAMA_CPP_STORAGE.llm
+        while not self._done.is_set():
+            if not self._cancelled.is_set() and mm.processing_interrupted():
+                self._cancelled.set()
+                print("[llama-cpp_vlm] Cancel requested; aborting generation...")
+            if self._cancelled.is_set():
+                # Keep aborting until the call returns: llama.cpp *clears* its
+                # abort event at the start of every completion, so a cancel
+                # pressed during a long image/video prefill would otherwise be
+                # dropped right before sampling begins.
+                self._abort(llm)
+            self._done.wait(self.POLL_INTERVAL)
+
+    @staticmethod
+    def _abort(llm):
+        try:
+            if llm is not None:
+                if hasattr(llm, "abort"):
+                    llm.abort()
+                event = getattr(llm, "_abort_event", None)
+                if event is not None:
+                    event.set()
+        except Exception:
+            pass
+
+
+def _llama_completion(label, **kwargs):
+    """Run create_chat_completion so ComfyUI's cancel button stops it.
+
+    Also wraps the call in the live telemetry monitor (token counter +
+    cumulative tok/s printed every 2 seconds, plus a prefill/decode summary).
+    """
+    with _LlamaCancelBridge(label):
+        with InferenceStats.completion(label, LLAMA_CPP_STORAGE.llm) as run_stats:
+            output = LLAMA_CPP_STORAGE.llm.create_chat_completion(**kwargs)
+            run_stats.record_result(output)
+            return output
+
+
+def _free_vram_before_load(required_bytes, enabled):
+    """Evict ComfyUI models / clear the CUDA cache before a big llama load.
+
+    ``comfy.model_management.free_memory`` only unloads as much as needed for
+    the requested amount, so unrelated models survive when there is room.
+    Returns the free-VRAM bytes reported after cleanup (or None if the probe
+    is unavailable).
+    """
+    if not enabled:
+        print("[llama-cpp_vlm] VRAM cleanup: disabled by node setting")
+        return None
+
+    try:
+        device = mm.get_torch_device()
+        before = mm.get_free_memory(device)
+        mm.free_memory(int(max(0, required_bytes) * 1.05), device)
+        mm.soft_empty_cache()
+        after = mm.get_free_memory(device)
+        print(
+            f"[llama-cpp_vlm] VRAM cleanup: free {before / GIB:.2f} GB -> "
+            f"{after / GIB:.2f} GB (reserving {required_bytes / GIB:.2f} GB)"
+        )
+        return after
+    except mm.InterruptProcessingException:
+        raise
+    except Exception as e:
+        print(f"[llama-cpp_vlm] VRAM cleanup failed (continuing): {e}")
+        return None
+
 
 any_type = AnyType("*")
 
@@ -453,7 +759,11 @@ class _DynamicImageInputs:
         if key in self._explicit_inputs:
             return self._explicit_inputs[key]
         if _is_image_input(key) or key == _LEGACY_IMAGE_INPUT:
-            return ("IMAGE", {"tooltip": "Image input. Connect to add more inputs (max 9)."})
+            return ("IMAGE", {
+                "tooltip": "Dynamically added image slot (image_1 ... image_9).\n"
+                           "One image per connected slot in 'one by one' mode (each gets its own answer), all of them packed into a single prompt in 'images' mode, one video clip per slot in 'video' mode.\n"
+                           "A batch (or list) inside one slot is treated as a frame sequence of that item, downscaled to fit max_size."
+            })
         raise KeyError(key)
 
 def parse_json(json_str):
@@ -541,33 +851,91 @@ class llama_cpp_model_loader:
         mmproj_list = ["None"] + [f for f in all_llms if "mmproj" in f.lower()]
             
         return {"required": {
-            "model": (model_list,),
-            "mmproj": (mmproj_list, {"default": "None"}),
-            "chat_handler": (chat_handlers, {"default": "None"}),
+            "model": (model_list, {
+                "tooltip": "GGUF LLM checkpoint to load, listed from ComfyUI/models/LLM (mmproj projectors are filtered out of this list).\nOnly one llama-cpp model is resident: switching this - or changing any other widget on the loader - reloads the model on the next run."
+            }),
+            "mmproj": (mmproj_list, {
+                "default": "None",
+                "tooltip": "Multimodal projector (mmproj) GGUF that gives the checkpoint its vision / audio encoder.\n'None' = plain text-only model; image, video and audio inputs are then rejected by the Instruct node.\nMust be the projector shipped for the same checkpoint as 'model', and 'chat_handler' must not be 'None'."
+            }),
+            "chat_handler": (chat_handlers, {
+                "default": "None",
+                "tooltip": "Chat template / message formatter for the checkpoint; it must match the model family (required when an mmproj is selected).\n'-Thinking' variants force the model's reasoning mode on, and this choice also picks the reasoning tags used by the Instruct node's 'auto' handling.\nKeep 'None' for text-only LLMs without a chat template."
+            }),
             "n_ctx": ("INT", {
                 "default": 32768,
                 "min": 1024, "max": 327680, "step": 128,
-                "tooltip": "Context length limit."
+                "tooltip": "Context window in tokens: prompt + generated text + image/video tokens all count against it.\nClamped down to the limit baked into the GGUF. The KV cache is reserved up-front for this size, so VRAM cost grows roughly linearly with n_ctx - lower it (or quantize cache_type_k/v) before raising it past the model default."
             }),
             "vram_limit": ("INT", {
                 "default": -1,
                 "min": -1, "max": 1024, "step": 1,
-                "tooltip": "VRAM usage limit in GB (-1 = no limit)\nReference range; actual usage may slightly exceed."
+                "tooltip": "VRAM budget in GB used to decide how many transformer layers go to the GPU (-1 = keep everything on the GPU).\nWeights + KV cache + mmproj are fitted against this budget, and the split is printed in the console on load; actual usage may slightly exceed it. A reference figure, not a hard cap unless enforce_vram is on."
             }),
-            "image_min_tokens": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32}),
-            "image_max_tokens": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 32}),
-            "load_mtp": ("BOOLEAN", {"default": False}),
-            "cache_type_k": (["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl"], {"default": "f16"}),
-            "cache_type_v": (["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl"], {"default": "f16"}),
+            "image_min_tokens": ("INT", {
+                "default": 0, "min": 0, "max": 8192, "step": 32,
+                "tooltip": "Smallest vision-token budget per input image (MTMD models and Qwen3-VL; ignored by other handlers).\n0 = take the default from the checkpoint's GGUF metadata. Lower values let small images use fewer vision tiles: faster prefill, less fine detail."
+            }),
+            "image_max_tokens": ("INT", {
+                "default": 0, "min": 0, "max": 8192, "step": 32,
+                "tooltip": "Largest vision-token budget per input image (MTMD models and Qwen3-VL; ignored by other handlers).\n0 = take the default from the checkpoint's GGUF metadata. Higher keeps more detail in large images but eats more of n_ctx and slows prefill; must be >= image_min_tokens."
+            }),
+            "load_mtp": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Load Multi-Token-Prediction (nextn) layers so the model can speculate several tokens per step - faster decode, same output.\nNeeds both a GGUF that ships nextn layers and a llama-cpp-python build exposing load_mtp; otherwise the console reports it as unavailable/not active and nothing changes."
+            }),
+            "cache_type_k": (["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl"], {
+                "default": "f16",
+                "tooltip": "Storage type of the KEY half of the KV cache.\n'f16' is lossless; quantized types (q8_0 down to iq2_xxs) roughly halve KV-cache VRAM per step down, at a small quality cost that grows as you go lower. Pick a smaller type to afford a bigger n_ctx on a tight GPU."
+            }),
+            "cache_type_v": (["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl"], {
+                "default": "f16",
+                "tooltip": "Storage type of the VALUE half of the KV cache (same trade-off as cache_type_k: less VRAM per step down, slightly more quality loss).\nValues tolerate quantization a bit better than keys, so q8_0/q4_0 here with f16 for keys is a common compromise."
+            }),
+            # Appended last so old workflows keep their widget-value order.
+            "free_vram": ("BOOLEAN", {
+                "default": True,
+                "tooltip": "Before loading, free VRAM by unloading ComfyUI models / clearing the CUDA cache.\n"
+                           "Only unloads as much as the estimated checkpoint + KV + mmproj needs."
+            }),
+            "enforce_vram": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Keep checkpoint + KV cache + mmproj inside vram_limit.\n"
+                           "When the estimate is over, extra layers are offloaded to system RAM;\n"
+                           "loading is refused if even one GPU layer cannot fit. Requires vram_limit != -1."
+            }),
+            "skip_mmproj": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Do not load the selected mmproj projector (run text-only).\n"
+                           "Image/audio inputs will be rejected until this is off and the model is reloaded."
+            }),
             }
         }
 
+    DESCRIPTION = (
+        "Loads a GGUF checkpoint with llama-cpp-python and hands out a llama_model handle to the "
+        "'Llama-cpp Instruct' and 'Llama-cpp Text Encoder' nodes.\n"
+        "model / mmproj / chat_handler must all belong to the same model family; vram_limit and n_ctx "
+        "decide the GPU-layer split, and the load plan (weights + KV cache + mmproj estimate) is "
+        "printed to the console.\n"
+        "Only one llama-cpp model is resident at a time: changing any widget here reloads it on the "
+        "next run, and 'free_vram' evicts other ComfyUI models first so the load fits."
+    )
     RETURN_TYPES = ("LLAMACPPMODEL",)
     RETURN_NAMES = ("llama_model",)
+    OUTPUT_TOOLTIPS = (
+        "llama_model: not data - a handle to the loaded GGUF plus every setting from this node "
+        "(model, mmproj, chat_handler, n_ctx, vram_limit, cache types, ...).\n"
+        "Connect it to 'Llama-cpp Instruct' or 'Llama-cpp Text Encoder'. Nothing is computed and "
+        "nothing is loaded until a downstream node runs; the same model is reused across runs while "
+        "this configuration stays unchanged.",
+    )
     FUNCTION = "loadmodel"
     CATEGORY = "llama-cpp-vlm"
 
-    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens, image_max_tokens, load_mtp, cache_type_k, cache_type_v):
+    def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens,
+                  image_max_tokens, load_mtp, cache_type_k, cache_type_v,
+                  free_vram=True, enforce_vram=False, skip_mmproj=False):
         custom_config = {
             "model": model,
             "mmproj": mmproj,
@@ -578,7 +946,10 @@ class llama_cpp_model_loader:
             "image_max_tokens": image_max_tokens,
             "load_mtp": load_mtp,
             "cache_type_k": cache_type_k,
-            "cache_type_v": cache_type_v
+            "cache_type_v": cache_type_v,
+            "free_vram": free_vram,
+            "enforce_vram": enforce_vram,
+            "skip_mmproj": skip_mmproj
         }
         if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != custom_config:
             print("[llama-cpp_vlm] Loading model...")
@@ -589,21 +960,31 @@ class llama_cpp_instruct_adv:
     @classmethod
     def INPUT_TYPES(s):
         optional_inputs = {
-            "parameters": ("LLAMACPPARAMS",),
+            "parameters": ("LLAMACPPARAMS", {
+                "tooltip": "Output of a 'Llama-cpp Parameters' node: max_tokens, temperature, top_k / top_p / min_p / typical_p, the repetition penalties, mirostat settings and state_uid.\nLeave unconnected to fall back to llama-cpp's built-in defaults (short, fairly random answers), and use it to drive several Instruct nodes with one shared sampling profile.\nstate_uid is read from here, not from a widget on this node."
+            }),
             # Native dynamic-slot spec (COMFY_AUTOGROW_V3): the frontend grows
             # image_1..image_9 slots from this template, starting with 2 slots.
             # Same wire format the V3 io.Autogrow API emits (see comfy_extras/nodes_boogu.py).
             "images": ("COMFY_AUTOGROW_V3", {
-                "tooltip": "Image inputs. Connect to add more inputs (max 9).",
+                "tooltip": "Image inputs: image_1 ... image_9, added automatically as you connect them (2 slots shown by default, 9 max).\nWhat each slot means depends on inference_mode - 'one by one' answers each connected image (or batch) separately, 'images' packs every connected image into a single prompt, 'video' treats each one as a separate clip.\nNeeds a model loaded with an mmproj and a matching chat_handler.",
                 "template": {
-                    "input": {"required": {"image": ("IMAGE", {})}},
+                    "input": {"required": {"image": ("IMAGE", {
+                        "tooltip": "One image (or an IMAGE batch, which is treated as a frame sequence). Different slots may have different sizes.\nImages are JPEG-encoded for the model; batches and frames are downscaled first so the longest edge fits 'max_size'."
+                    })}},
                     "names": [f"image_{i}" for i in range(1, 10)],
                     "min": 2,
                 },
             }),
-            "video": ("VIDEO", {"tooltip": "Video input (e.g. from 'Load Video'). Frames are sampled like an image batch."}),
-            "audio": ("AUDIO", {"tooltip": "Audio input (e.g. from 'Load Audio'). Requires an audio-capable model such as Qwen3-ASR."}),
-            "queue_handler": (any_type, {"tooltip": "Used to control the execution order of instruct nodes."}),
+            "video": ("VIDEO", {
+                "tooltip": "Video input (e.g. from 'Load Video'). It is decoded into frames and added as one extra item alongside the image slots; in 'video' mode the frames are resampled down to 'max_frames'.\nNeeds a model loaded with an mmproj."
+            }),
+            "audio": ("AUDIO", {
+                "tooltip": "Audio input (e.g. from 'Load Audio'), sent to the model as a WAV clip for transcription / audio understanding.\nRequires a chat_handler with audio support (e.g. Qwen3-ASR) and an mmproj that is not skipped - otherwise the run raises. Works without any image input."
+            }),
+            "queue_handler": (any_type, {
+                "tooltip": "Any value, existing purely to pin execution order: chain several Instruct nodes with output -> queue_handler so they run one after another instead of in parallel.\nIt is never given to the model and does not change the answer."
+            }),
         }
         stack = inspect.stack()
         if len(stack) > 2 and stack[2].function == "get_input_info":
@@ -612,48 +993,65 @@ class llama_cpp_instruct_adv:
 
         return {
             "required": {
-                "llama_model": ("LLAMACPPMODEL",),
-                "preset_prompt": (preset_tags, {"default": preset_tags[1]}),
-                "custom_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": 'user_prompt\n\nFor preset hints marked with an "*", this will be used to fill the placeholder (e.g., Object names in BBox detection)\nOtherwise, this will override the preset prompts.'}),
-                "system_prompt": ("STRING", {"multiline": True, "default": ""}),
+                "llama_model": ("LLAMACPPMODEL", {
+                    "tooltip": "The 'llama_model' output of a 'Llama-cpp Model Loader'.\nThe model itself is loaded lazily on the first run and stays resident between runs, so re-running with new prompts is fast; image / video / audio inputs additionally require the loader to have an mmproj and a matching chat_handler."
+                }),
+                "preset_prompt": (preset_tags, {
+                    "default": preset_tags[1],
+                    "tooltip": "Built-in user-prompt template - what you ask the model to do (describe, tag, analyse, locate objects...).\n'@' inside a preset becomes the word 'image' (or 'video' in video mode).\nPreset names carrying a '*' are the exception: they are templates with a fill-in slot, and custom_prompt supplies that slot instead of replacing the preset (e.g. 'Vision - *Bounding Box' expects the object names to locate)."
+                }),
+                "custom_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": 'user_prompt\n\nFor preset hints marked with an "*", this will be used to fill the placeholder (e.g., Object names in BBox detection)\nOtherwise, this will override the preset prompts.',
+                    "tooltip": "Your own user prompt, sent together with the images.\nFor presets whose name is marked with '*' this text fills the preset's placeholder (the object names to detect, the topic to expand, ...).\nFor every other preset a non-empty value replaces the preset text outright, and leaving it empty sends the preset unchanged."
+                }),
+                "system_prompt": ("STRING", {"multiline": True, "default": "",
+                    "tooltip": "System message defining the model's role, style and output rules (e.g. 'answer with JSON only'), or the enhancer prompt from a 'Prompt Enhancer Preset' node.\nIn video mode a hint that the frames are a video is prefixed automatically.\nWhile save_states is on, an unchanged system_prompt continues the stored conversation; editing it drops that history and starts over."
+                }),
                 "reasoning_handling": (["auto", "strip", "keep", "custom tags"], {
                     "default": "auto",
                     "tooltip": "How to treat reasoning (thinking) content in the model output.\n"
                                "auto: use the reasoning format detected from the loader's model type / GGUF chat template, split it into the 'reasoning' output\n"
                                "strip: remove reasoning content silently\n"
                                "keep: leave the output untouched\n"
-                               "custom tags: split using the tags given in custom_reasoning_tags"
+                               "custom tags: split using the tags given in custom_reasoning_tags\n"
+                               "Models that never emit thinking text leave 'reasoning' empty whatever you pick."
                 }),
                 "custom_reasoning_tags": ("STRING", {
                     "default": "", "multiline": False,
-                    "placeholder": "e.g. <seed:think>,</seed:think> (only for 'custom tags' mode)"
+                    "placeholder": "e.g. <seed:think>,</seed:think> (only for 'custom tags' mode)",
+                    "tooltip": "The two delimiters that wrap the thinking text, written as start_tag,end_tag (e.g. <seed:think>,</seed:think> or <think>,</think>).\nOnly used when reasoning_handling = 'custom tags': everything between them goes to 'reasoning'/'reasoning_list' and is cut out of 'output'.\nLeaving it empty in that mode makes the run fail. Ignored by every other mode."
                 }),
                 "inference_mode": (["one by one", "images", "video"], {
                     "default": "one by one",
-                    "tooltip": "one by one: Process each item in the input list one by one (multi-image batch inside an item will be inferred together)\nimages:  \tCombine ALL images across all list items into 1 single prompt\nvideo:  \tTreat each image item in the list as a separate video clip"
+                    "tooltip": "How the connected images / batches are grouped into prompts.\n"
+                               "one by one: one completion per input item (each image, or each frame batch, answered separately); 'output' concatenates the answers with '====== Item N ======' headers, 'output_list' keeps them apart.\n"
+                               "images: ALL images of ALL items are packed into 1 single prompt, for a joint comparison or summary - 'output_list' then holds one element.\n"
+                               "video: every item is treated as its own video clip, resampled to max_frames and answered clip by clip."
                 }),
                 "max_frames": ("INT", {
                     "default": 24,
                     "min": 2,
                     "max": 1024,
                     "step": 1,
-                    "tooltip": 'Number of frames to sample evenly from input video.\n(for "video" mode only)'
+                    "tooltip": 'How many frames are sampled evenly across each clip when inference_mode = "video" (2-1024); ignored by the other modes.\nMore frames catch more motion but each one costs vision tokens from n_ctx and prefill time. Frames are resized to fit max_size first.'
                 }),
                 "max_size": ("INT", {
                     "default": 256,
                     "min": 128,
                     "max": 16384,
                     "step": 64,
-                    "tooltip": 'Max size of input images in "images" and "video" modes.'
+                    "tooltip": 'Longest-edge size in pixels that input images are downscaled to before being sent to the model (never upscaled).\nApplies to every frame in "images" and "video" modes, and to batches of 2+ images inside one item in "one by one" mode - a lone image is sent at full resolution.\nSmaller = far fewer vision tokens and faster prefill, but small text and fine detail disappear.'
                 }),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1,
+                    "tooltip": "Sampling seed for the generation. Same seed + same prompt + same parameters reproduce the same answer; change it (or use the frontend's randomize) to explore different wording.\nIt only affects token sampling - the vision encoding and the prompt building stay deterministic."
+                }),
                 "force_offload": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Unload the model after inference."
+                    "tooltip": "Unload the llama-cpp model from RAM/VRAM the moment this node finishes, leaving room for other ComfyUI models (useful at the end of a prompt-enhance -> sample chain).\nCosts a full model reload on the next run, so keep it off while you are still iterating on prompts."
                 }),
                 "save_states": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Preserve the context of this conversation in RAM."
+                    "tooltip": "Multi-turn chat: keep this conversation (system prompt + user/assistant turns, images stripped out) in RAM under the state id, so the next run continues where it left off instead of starting fresh.\nOff = a single standalone question, and any state stored under this id is cleared. Change system_prompt or use 'Llama-cpp Clean States' to reset it."
                 }),
             },
             "hidden": {
@@ -662,8 +1060,37 @@ class llama_cpp_instruct_adv:
             "optional": optional_inputs,
         }
     
+    DESCRIPTION = (
+        "Runs one chat completion on the loaded GGUF model: a prompt (preset or your own) plus any "
+        "images, video or audio you connect, and returns the answer with the model's reasoning kept "
+        "on a separate output.\n"
+        "inference_mode chooses how inputs are grouped (one completion per image / all images in one "
+        "prompt / one completion per video clip); save_states turns it into a multi-turn conversation "
+        "stored in RAM under state_uid.\n"
+        "Sampling comes from the optional 'parameters' input, and the node accepts list inputs, so one "
+        "node can answer a whole batch."
+    )
     RETURN_TYPES = ("STRING", "STRING", "INT", "STRING", "STRING")
     RETURN_NAMES = ("output", "output_list", "state_uid", "reasoning", "reasoning_list")
+    OUTPUT_TOOLTIPS = (
+        "output: the model's final answer as one STRING, with the reasoning removed according to "
+        "reasoning_handling.\n"
+        "In 'one by one' / 'video' mode every processed item is joined here with blank lines and "
+        "labelled '====== Item N ======' / '====== Video Clip N ======' - use output_list when you "
+        "need them apart. Code fences are left as-is; unwrap them with 'Unpack Code Block'.",
+        "output_list: the same answers as a LIST of STRING, one element per processed item "
+        "(per image / per frame batch / per video clip), aligned with reasoning_list.\n"
+        "Use it to feed one downstream node per result; in 'images', audio-only and text-only mode it "
+        "contains a single element.",
+        "state_uid: the id this conversation's history is stored under - the node's own unique id, or "
+        "the state_uid set on the 'Llama-cpp Parameters' node when that is not -1.\n"
+        "Connect it to 'Llama-cpp Clean States' to reset just this conversation and nothing else.",
+        "reasoning: the chain-of-thought / thinking text the model produced, joined across items.\n"
+        "Empty when reasoning_handling = 'strip' or when the model has no reasoning mode; with 'keep' "
+        "the thinking text stays inside output and this stays empty.",
+        "reasoning_list: the thinking text as a LIST of STRING, one element per processed item, "
+        "index-aligned with output_list.",
+    )
     OUTPUT_IS_LIST = (False, True, False, False, True)
     INPUT_IS_LIST = True  # 开启 LIST 支持
     FUNCTION = "process"
@@ -705,6 +1132,8 @@ class llama_cpp_instruct_adv:
         return clean_messages
     
     def process(self, llama_model, preset_prompt, custom_prompt, system_prompt, reasoning_handling, custom_reasoning_tags, inference_mode, max_frames, max_size, seed, force_offload, save_states, unique_id, parameters=None, images=None, video=None, audio=None, image_1=None, image_2=None, queue_handler=None, **kwargs):
+        # Honour a cancel that arrived before this run started touching the model.
+        _LlamaCancelBridge.check()
         # 解包 INPUT_IS_LIST 参数
         llama_model = llama_model[0] if isinstance(llama_model, list) else llama_model
         preset_prompt = preset_prompt[0] if isinstance(preset_prompt, list) else preset_prompt
@@ -724,8 +1153,10 @@ class llama_cpp_instruct_adv:
         audio = audio[0] if isinstance(audio, list) and audio else (None if isinstance(audio, list) else audio)
 
         if not LLAMA_CPP_STORAGE.llm:
+            _LlamaCancelBridge.check()
             LLAMA_CPP_STORAGE.load_model(llama_model)
-        
+            _LlamaCancelBridge.check()
+
         LLAMA_CPP_STORAGE.ensure_embedding_mode(False)
             
         if parameters is None:
@@ -811,10 +1242,13 @@ class llama_cpp_instruct_adv:
 
         # AUDIO 输入：编码为 base64 WAV，附加到用户消息
         # （one by one / video 模式会随 user_content 一起深拷贝到每个 item）
+        current_config = LLAMA_CPP_STORAGE.current_config or {}
+        mmproj_skipped = bool(current_config.get("skip_mmproj", False))
         audio_content_items = []
         if audio is not None:
             chat_handler = LLAMA_CPP_STORAGE.chat_handler
-            if chat_handler is None or not getattr(chat_handler, "is_support_audio", False):
+            if (chat_handler is None or mmproj_skipped
+                    or not getattr(chat_handler, "is_support_audio", False)):
                 raise ValueError("Audio input detected, but the loaded model is not configured with an audio-capable mmproj module (e.g. Qwen3-ASR).")
             audio_content_items.append({
                 "type": "input_audio",
@@ -823,8 +1257,8 @@ class llama_cpp_instruct_adv:
         user_content.extend(audio_content_items)
 
         if raw_image_list:
-            curr_mmproj = LLAMA_CPP_STORAGE.current_config.get("mmproj") if LLAMA_CPP_STORAGE.current_config else None
-            if LLAMA_CPP_STORAGE.chat_handler is None or curr_mmproj in [None, "None"]:
+            curr_mmproj = current_config.get("mmproj")
+            if LLAMA_CPP_STORAGE.chat_handler is None or mmproj_skipped or curr_mmproj in [None, "None"]:
                 raise ValueError("Image input detected, but the loaded model is not configured with a mmproj module.")
                 
             # image_groups[i] 对应输入 list 里的第 i 个 item (可能包含单帧或 Batch 多帧)
@@ -851,11 +1285,11 @@ class llama_cpp_instruct_adv:
                 tmp_list = []
                 
                 for item_idx, item_frames in enumerate(cqdm(image_groups)):
-                    if mm.processing_interrupted():
-                        raise mm.InterruptProcessingException()
-                        
+                    _LlamaCancelBridge.check()
+
                     curr_user_content = json.loads(json.dumps(user_content))
                     for frame in item_frames:
+                        _LlamaCancelBridge.check()
                         if len(item_frames) > 1:
                             data = image2base64(scale_image(frame, max_size))
                         else:
@@ -867,7 +1301,7 @@ class llama_cpp_instruct_adv:
                         })
                         
                     curr_messages = messages + [{"role": "user", "content": curr_user_content}]
-                    output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=curr_messages, seed=seed, **_parameters)
+                    output = _llama_completion("one by one", messages=curr_messages, seed=seed, **_parameters)
                     text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
                     text, reasoning = self._handle_reasoning(text, reasoning_handling, custom_reasoning_tags)
 
@@ -886,6 +1320,7 @@ class llama_cpp_instruct_adv:
                 print(f"[llama-cpp_vlm] [Images Mode] Packing ALL {len(all_frames)} images into 1 single completion...")
                 
                 for frame in all_frames:
+                    _LlamaCancelBridge.check()
                     if len(all_frames) > 1:
                         data = image2base64(scale_image(frame, max_size))
                     else:
@@ -894,9 +1329,9 @@ class llama_cpp_instruct_adv:
                         "type": "image_url",
                         "image_url": {"url": f"data:image/jpeg;base64,{data}"}
                     })
-                    
+
                 messages.append({"role": "user", "content": user_content})
-                output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
+                output = _llama_completion("images", messages=messages, seed=seed, **_parameters)
                 raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
 
                 out1, reasoning = self._handle_reasoning(raw_text, reasoning_handling, custom_reasoning_tags)
@@ -909,14 +1344,14 @@ class llama_cpp_instruct_adv:
                 tmp_list = []
                 
                 for v_idx, video_frames in enumerate(cqdm(image_groups)):
-                    if mm.processing_interrupted():
-                        raise mm.InterruptProcessingException()
-                        
+                    _LlamaCancelBridge.check()
+
                     indices = np.linspace(0, len(video_frames) - 1, min(len(video_frames), max_frames), dtype=int)
                     sampled_frames = [video_frames[i] for i in indices]
                     
                     curr_user_content = json.loads(json.dumps(user_content))
                     for frame in sampled_frames:
+                        _LlamaCancelBridge.check()
                         data = image2base64(scale_image(frame, max_size))
                         curr_user_content.append({
                             "type": "image_url",
@@ -924,7 +1359,7 @@ class llama_cpp_instruct_adv:
                         })
                         
                     curr_messages = messages + [{"role": "user", "content": curr_user_content}]
-                    output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=curr_messages, seed=seed, **_parameters)
+                    output = _llama_completion("video", messages=curr_messages, seed=seed, **_parameters)
                     text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
                     text, reasoning = self._handle_reasoning(text, reasoning_handling, custom_reasoning_tags)
 
@@ -940,7 +1375,7 @@ class llama_cpp_instruct_adv:
             # 纯音频模式（无图片/视频输入）：单次推理
             print("[llama-cpp_vlm] [Audio Mode] Processing audio input...")
             messages.append({"role": "user", "content": user_content})
-            output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
+            output = _llama_completion("audio", messages=messages, seed=seed, **_parameters)
             raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
 
             out1, reasoning = self._handle_reasoning(raw_text, reasoning_handling, custom_reasoning_tags)
@@ -951,7 +1386,7 @@ class llama_cpp_instruct_adv:
             # 纯文本模式
             text_string = "".join([item["text"] for item in user_content if item.get("type") == "text"])
             messages.append({"role": "user", "content": text_string})
-            output = LLAMA_CPP_STORAGE.llm.create_chat_completion(messages=messages, seed=seed, **_parameters)
+            output = _llama_completion("text", messages=messages, seed=seed, **_parameters)
             raw_text = output['choices'][0]['message']['content'].removeprefix(": ").lstrip()
 
             out1, reasoning = self._handle_reasoning(raw_text, reasoning_handling, custom_reasoning_tags)
@@ -988,26 +1423,76 @@ class llama_cpp_parameters:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "max_tokens": ("INT", {"default": 1024, "min": 0, "max": 32768, "step": 1}),
-                "top_k": ("INT", {"default": 30, "min": 0, "max": 1000, "step": 1}),
-                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "typical_p": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "temperature": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "present_penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "mirostat_mode": ("INT", {"default": 0, "min": 0, "max": 2, "step": 1}),
-                "mirostat_eta": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "mirostat_tau": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "max_tokens": ("INT", {
+                    "default": 1024, "min": 0, "max": 32768, "step": 1,
+                    "tooltip": "Hard cap on the number of tokens generated per answer (0 = no cap: run until the model stops or the context fills).\nReasoning/thinking tokens count towards it, so long CoT models need headroom here or the visible answer gets cut off. Every remaining token also costs from the loader's n_ctx."
+                }),
+                "top_k": ("INT", {
+                    "default": 30, "min": 0, "max": 1000, "step": 1,
+                    "tooltip": "Keep only the K most probable candidates at each step (0 = disabled). A hard shortlist: low values (10-20) give focused, safe, repetitive text; high values (200+) allow rarer wording and more mistakes."
+                }),
+                "top_p": ("FLOAT", {
+                    "default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Nucleus sampling: keep the smallest set of candidates whose probabilities add up to this value (0-1). 0.9 suits chat, 0.7-0.8 is tighter for factual/JSON output, values near 1.0 restore full diversity. Used together with top_k."
+                }),
+                "min_p": ("FLOAT", {
+                    "default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Drop any candidate whose probability is below this fraction of the best candidate's (0 = off, 0.02-0.1 typical). Scales with the model's confidence instead of cutting at a fixed rank, so it stays sensible on both very sure and very unsure steps."
+                }),
+                "typical_p": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Locally typical sampling: keep the candidates whose information content is closest to the average (1.0 = off). Below ~0.95 suppresses surprising tokens, which can reduce hallucinations but also makes the model duller or incoherent on creative tasks."
+                }),
+                "temperature": ("FLOAT", {
+                    "default": 0.8, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "How flat or peaked the token distribution is. 0 = greedy and fully deterministic (recommended for JSON / bbox / tag extraction), 0.2-0.5 factual tasks, ~0.8 chat default, above 1.2 increasingly creative and erratic.\nAffects everything else here: with mirostat enabled it is used only as the starting point."
+                }),
+                "repeat_penalty": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01,
+                    "tooltip": "Divides the probability of tokens already in the context, so values above 1.0 discourage repetition (1.0 = off). Small steps matter: 1.05-1.1 is mild, ~1.3 is usually the practical ceiling, and higher values corrupt spelling, code and non-English text."
+                }),
+                "frequency_penalty": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Subtract a penalty proportional to how many times a token already appeared (0 = off). Additive, so it punishes loops that repeat_penalty alone does not break - but it also erodes boilerplate that legitimately repeats, like JSON keys."
+                }),
+                "present_penalty": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 2.0, "step": 0.01,
+                    "tooltip": "Presence penalty: subtract a flat amount from every token that appeared at all, no matter how often (0 = off). Pushes the model toward new vocabulary in long answers.\nIgnored when the MTMD handler (DeepSeek-OCR) is loaded, which does not support it."
+                }),
+                "mirostat_mode": ("INT", {
+                    "default": 0, "min": 0, "max": 2, "step": 1,
+                    "tooltip": "Mirostat sampling steers the output toward a target perplexity instead of using fixed cut-offs. 0 = off (temperature/top_k/top_p apply), 1 = Mirostat 1, 2 = Mirostat 2 (the usual choice).\nWhen it is 1 or 2, temperature stops mattering and mirostat_tau / mirostat_eta take over."
+                }),
+                "mirostat_eta": ("FLOAT", {
+                    "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Mirostat learning rate: how hard each step corrects the sampling temperature to hit the target perplexity (only with mirostat_mode 1/2). Higher adapts faster but overshoots and sounds unstable; 0.05-0.2 is the usual band."
+                }),
+                "mirostat_tau": ("FLOAT", {
+                    "default": 5.0, "min": 0.0, "max": 10.0, "step": 0.01,
+                    "tooltip": "Mirostat target perplexity - the entropy the sampler aims for (only with mirostat_mode 1/2). Lower (2-4) is repetitive and predictable, 5 is close to natural human text, 8-10 is loose and surprising."
+                }),
                 "state_uid": ("INT", {
                     "default": -1, "min": -1, "max": 999999, "step": 1,
-                    "tooltip": "Use a specific ID to save the conversation state.\n(-1 = use node's unique_id)"
+                    "tooltip": "Use a specific ID to save the conversation state.\n(-1 = use node's unique_id)\nSet the same id on two 'Llama-cpp Instruct' nodes to let them share one chat history (a follow-up question asked from a second node), or give each branch its own id to keep conversations apart.\nThe id is also what 'Llama-cpp Clean States' deletes."
                 }),
             }
         }
+    DESCRIPTION = (
+        "Collects the sampling options for a 'Llama-cpp Instruct' node. This node computes nothing - "
+        "the values are passed through unchanged (state_uid aside, which the Instruct node reads to "
+        "choose the conversation state).\n"
+        "Connect its output to the Instruct node's 'parameters' input; leave that input unconnected to "
+        "use llama-cpp-python's own defaults."
+    )
     RETURN_TYPES = ("LLAMACPPARAMS",)
     RETURN_NAMES = ("parameters",)
+    OUTPUT_TOOLTIPS = (
+        "parameters: a bundle of every widget above (max_tokens, top_k, top_p, min_p, typical_p, "
+        "temperature, the three penalties, the mirostat settings) plus state_uid, forwarded to the "
+        "'parameters' input of 'Llama-cpp Instruct'.\n"
+        "One bundle can drive several Instruct nodes, but note that state_uid travels with it, so "
+        "sharing it also shares the conversation state.",
+    )
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
     def process(self, **kwargs):
@@ -1018,16 +1503,30 @@ class llama_cpp_clean_states:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "any": (any_type,),
+                "any": (any_type, {
+                    "tooltip": "Any value, purely to make this node part of the execution chain - it is handed straight back out unchanged.\nTypical use: connect an Instruct node's state_uid output here, or splice it between the model loader and the next node so the wipe happens at the right moment."
+                }),
                 "state_uid": ("INT", {
                     "default": -1, "min": -1, "max": 999999, "step": 1,
-                    "tooltip": "Clear the saved state for a specific ID (-1 = clear all)"
+                    "tooltip": "Clear the saved state for a specific ID (-1 = clear all)\nUse the exact id from an Instruct node's state_uid output to reset one conversation; -1 wipes the stored history and system prompt of every Instruct node.\nAn id that was never saved is not an error - nothing happens."
                 }),
             },
         }
     
+    DESCRIPTION = (
+        "Deletes the conversation history that 'Llama-cpp Instruct' keeps in RAM when save_states is "
+        "on, so the next run of that node starts a brand-new chat instead of continuing the old one.\n"
+        "Nothing is unloaded from VRAM - the model itself stays loaded. Changing an Instruct node's "
+        "system_prompt clears its state automatically, so this node is mainly for keeping one fixed "
+        "system prompt while still restarting the conversation."
+    )
     RETURN_TYPES = (any_type,)
     RETURN_NAMES = ("any",)
+    OUTPUT_TOOLTIPS = (
+        "any: the identical value received on the 'any' input, unchanged - pass-through so the wipe can "
+        "be inserted anywhere in a chain without disturbing its data.\n"
+        "The node itself produces no other result.",
+    )
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1039,10 +1538,24 @@ class llama_cpp_clean_states:
 class llama_cpp_unload_model:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"any": (any_type,)}}
+        return {"required": {"any": (any_type, {
+            "tooltip": "Any value, purely to trigger this node at a chosen point in the graph; it is returned untouched.\nConnect whatever downstream node must run after the unload (for example a checkpoint loader or a KSampler) so the VRAM is free by the time it executes."
+        })}}
     
+    DESCRIPTION = (
+        "Frees the llama-cpp model - weights, KV cache, mmproj and chat handler - from RAM/VRAM when "
+        "this node executes, so a diffusion model can take the memory back.\n"
+        "Saved conversation states are dropped too. The next loader or Instruct run simply re-reads the "
+        "GGUF from disk, which costs load time; use the 'force_offload' switch instead when you want "
+        "the same node to release the memory after its own answer."
+    )
     RETURN_TYPES = (any_type,)
     RETURN_NAMES = ("any",)
+    OUTPUT_TOOLTIPS = (
+        "any: the same value received on the 'any' input, unchanged - pass-through so the unload can be "
+        "spliced into an existing chain.\n"
+        "No model handle is produced: after this node the previous llama_model must be reloaded.",
+    )
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1056,21 +1569,49 @@ class json_to_bbox:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "json": ("STRING", {"forceInput": True}),
-                "mode": (["simple", "Qwen3-VL", "Qwen2.5-VL"], {"default": "simple"}),
+                "json": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "JSON text holding the detected boxes, usually an Instruct node's 'output' (list inputs are accepted, one JSON per image).\nExpected shape: [{\"bbox_2d\": [x1, y1, x2, y2], \"label\": \"name\"}, ...] - a single object works too, and ```json fences are stripped automatically.\nAnything that does not parse as JSON raises; ask the model for that schema with the 'Vision - *Bounding Box' preset."
+                }),
+                "mode": (["simple", "Qwen3-VL", "Qwen2.5-VL"], {
+                    "default": "simple",
+                    "tooltip": "Which coordinate space the JSON numbers are in.\n"
+                               "simple: the values are already pixel coordinates and are used verbatim.\n"
+                               "Qwen3-VL / Qwen2.5-VL: those models report boxes on a normalized 0-1000 grid, so x is rescaled by the connected image's width and y by its height - the 'image' input is mandatory in these modes.\n"
+                               "Pick the mode matching the chat_handler of the model that wrote the JSON."
+                }),
                 "label": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "tooltip": "Select only the BBoxes with specific labels."
+                    "tooltip": "Select only the BBoxes with specific labels.\nExact, case-sensitive match against each item's \"label\" (or \"text_content\" for OCR-style output); several names are not supported - run the node once per label instead.\nEmpty keeps every box. Filtering happens before conversion, so the BBOX output and the preview image agree."
                 }),
             },
             "optional": {
-                "image": ("IMAGE",),
+                "image": ("IMAGE", {
+                    "tooltip": "The source image(s) the JSON refers to: batches are split frame by frame, and each JSON answer is paired with the frame of the same index (the last frame is reused if there are more answers than images).\nOptional in 'simple' mode, required for the Qwen modes. When connected, the boxes are also drawn here for preview."
+                }),
             }
         }
     
+    DESCRIPTION = (
+        "Turns the JSON bounding-box output of a vision model into ComfyUI BBOX regions, rescaling the "
+        "Qwen 0-1000 grid to real pixels when asked, filtering by label, and drawing the labelled "
+        "boxes back onto a copy of the source image for inspection.\n"
+        "The BBOX output feeds the SEGS / MASK helpers in this pack or any node that takes boxes "
+        "(crop, detail, inpaint)."
+    )
     RETURN_TYPES = ("BBOX", "IMAGE")
     RETURN_NAMES = ("bboxes", "image_list")
+    OUTPUT_TOOLTIPS = (
+        "bboxes: a LIST with one entry per JSON input; each entry is itself a list of "
+        "(x1, y1, x2, y2) boxes in real pixel coordinates, in the order the model reported them.\n"
+        "Items without a usable \"bbox_2d\" key are skipped. Use 'BBoxes to BBox' to pull a single box "
+        "out of this nesting.",
+        "image_list: copy of the connected image(s) with each box drawn as a coloured rectangle and its "
+        "label in a filled tag above it - one colour per distinct label.\n"
+        "The original batch structure is preserved and the source pixels are never modified; empty when "
+        "no image is connected. Drawings are preview only and are not part of the BBOX data.",
+    )
     OUTPUT_IS_LIST = (True, True)
     INPUT_IS_LIST = True
     FUNCTION = "process"
@@ -1165,14 +1706,38 @@ class bbox_to_segs:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "bboxes": ("BBOX",),
-                "image": ("IMAGE",),
-                "dilation": ("INT", {"default": 10, "min": 0, "max": 200, "step": 1}),
-                "feather": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+                "bboxes": ("BBOX", {
+                    "tooltip": "The BBOX regions to convert - from 'JSON to BBoxes' or any node producing boxes.\nNested input (one list of boxes per image) is flattened into one segment per box; entries that are not a 4-number box are skipped with a console warning."
+                }),
+                "image": ("IMAGE", {
+                    "tooltip": "The image the boxes were detected on. Its pixel size defines the SEGS canvas, and frame image[0] of the batch is what actually gets cropped into the segments - so for a batch, run one node per frame.\nMust match the coordinate space the boxes are in."
+                }),
+                "dilation": ("INT", {
+                    "default": 10, "min": 0, "max": 200, "step": 1,
+                    "tooltip": "Grow the crop by this many pixels on every side, so each segment keeps some context around the detection - model boxes are usually a little tight, and detailers inpaint better with margin.\nThe mask stays white only inside the original box, so the extra border is context, not selection."
+                }),
+                "feather": ("INT", {
+                    "default": 0, "min": 0, "max": 100, "step": 1,
+                    "tooltip": "Gaussian blur radius (sigma in pixels) applied to the segment mask edges. 0 = hard rectangle; 2-10 gives a soft blend so an inpaint or detail pass disappears into the surroundings.\nToo high and the mask fades to grey, which weakens the selection."
+                }),
             }
         }
     
+    DESCRIPTION = (
+        "Builds SEGS segments - cropped image + mask per region - out of BBOX regions, so VLM "
+        "detections can drive segmentation-based nodes such as detailers, croppers and segment "
+        "mask-combiners.\n"
+        "Each segment carries the dilated crop, the (optionally feathered) rectangular mask, the crop "
+        "region, confidence 0.9 and the label 'bbox'."
+    )
     RETURN_TYPES = ("SEGS",)
+    OUTPUT_TOOLTIPS = (
+        "SEGS: a (canvas_size, [SEG, ...]) pair - one SEG per box, holding cropped_image [1, 3, crop_h, "
+        "crop_w] padded to the dilated region, the cropped_mask as a numpy rectangle, confidence 0.9, "
+        "crop_region, the original bbox and label 'bbox'.\n"
+        "Consumed by Impact Pack / segment nodes (SEGSDetailer, SEGS-to-DETAILER, Crop...); the box "
+        "labels are generic, so the LLM's class names are not carried over.",
+    )
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1258,15 +1823,36 @@ class bbox_to_mask:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "bboxes": ("BBOX",),
-                "image": ("IMAGE",),
-                "dilation": ("INT", {"default": 10, "min": 0, "max": 200, "step": 1}),
-                "feather": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+                "bboxes": ("BBOX", {
+                    "tooltip": "The BBOX regions to paint - from 'JSON to BBoxes' or 'BBoxes to BBox'.\nNested input (one list per image) is flattened, and every box in the list is merged into the single returned mask; malformed entries are skipped with a console warning."
+                }),
+                "image": ("IMAGE", {
+                    "tooltip": "Only used for its dimensions: the mask is produced at the size of frame image[0] of the batch, so boxes stay in the right place. No pixels are read.\nFor a batch, run one node per frame (or feed the matching single-frame image)."
+                }),
+                "dilation": ("INT", {
+                    "default": 10, "min": 0, "max": 200, "step": 1,
+                    "tooltip": "Pixels of extra room rendered around each box. The white rectangle itself keeps the box size, so with feather = 0 this changes nothing - it exists so a feathered edge has space to spread before the render window clips it.\nRaise it together with feather (roughly 2-3x sigma) for soft masks."
+                }),
+                "feather": ("INT", {
+                    "default": 0, "min": 0, "max": 100, "step": 1,
+                    "tooltip": "Gaussian blur sigma in pixels applied to the box edges: 0 = crisp rectangle, 2-10 = soft gradient for inpaint masks and compositing that blend into the surroundings.\nOverlapping soft masks are merged with max(), never added, so they cannot exceed 1.0."
+                }),
             }
         }
     
+    DESCRIPTION = (
+        "Rasterizes BBOX regions into one MASK covering all of them - the bridge from a VLM detection "
+        "to anything that takes a mask: inpainting, masked compositing, mask-aware crops, analysis.\n"
+        "Boxes are merged with max(), and the mask takes the size of the connected image."
+    )
     RETURN_TYPES = ("MASK",)
     RETURN_NAMES = ("mask",)
+    OUTPUT_TOOLTIPS = (
+        "mask: a single MASK of shape [1, height, width] matching the connected image - 1.0 inside every "
+        "(optionally feathered) box, 0.0 everywhere else, overlaps merged rather than added.\n"
+        "All boxes land on this one mask; drop to a single box with 'BBoxes to BBox' first when you need "
+        "one mask per detection.",
+    )
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1330,20 +1916,35 @@ class bboxes_to_bbox:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "bboxes": ("BBOX",),
-                "image_index": ("INT", {"default": 0, "min": 0, "max": 1000000, "step": 1}),
+                "bboxes": ("BBOX", {
+                    "tooltip": "The BBOX data to pick from - normally the 'bboxes' output of 'JSON to BBoxes', which is a list of per-image box lists; a flat list of boxes works too (image_index is then ignored).\nA nested and a flat input are detected automatically from the first element."
+                }),
+                "image_index": ("INT", {
+                    "default": 0, "min": 0, "max": 1000000, "step": 1,
+                    "tooltip": "Which image's box list to read (0 = first), for the nested output of 'JSON to BBoxes' where each input frame produced its own answer.\nIgnored when the input is already a flat list of boxes. Values beyond the available range are clamped to the last list instead of failing."
+                }),
                 "bbox_index": ("INT", {
                     "default": 0,
                     "min": -998,
                     "max": 999,
                     "step": 1,
-                    "tooltip": "BBox index in the image. Set to 999 to get all bboxes."
+                    "tooltip": "BBox index in the image. Set to 999 to get all bboxes.\n0 = the first box the model reported, 1 = the second, and so on; negative values clamp to the first box and values past the end clamp to the last one.\nThe order follows the model's own output order, so ask for what you want first in the prompt (or filter with the label widget of 'JSON to BBoxes')."
                 }),
             }
         }
     
+    DESCRIPTION = (
+        "Selects a single bounding box - or all of them - out of a BBOX list by image and index, so one "
+        "detection can be routed to one downstream node (one SEGS, one mask, one crop per person/object).\n"
+        "Pair it with an Index/Repeat-style node to loop over the detections of an image."
+    )
     RETURN_TYPES = ("BBOX",)
     RETURN_NAMES = ("bbox",)
+    OUTPUT_TOOLTIPS = (
+        "bbox: a BBOX list holding just the selected box as (x1, y1, x2, y2) in pixels - or the complete "
+        "unpicked list when bbox_index = 999, which is the input for 'BBoxes to SEGS' / 'BBoxes to MASK'.\n"
+        "Empty list when the input had no boxes at all.",
+    )
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1386,16 +1987,48 @@ class parse_json_node:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "input": ("STRING", {"forceInput": True}),
+                "input": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "The JSON text to read - connect the 'output' of an Instruct node (or 'Unpack Code Block').\n```json fences are stripped first, and a LIST of strings is parsed element by element, giving one result per input on every output."
+                }),
             },
             "optional": {
-                "key": ("STRING", {"default": ""}),
-                "default": ("STRING", {"default": ""}),
+                "key": ("STRING", {
+                    "default": "",
+                    "tooltip": "Which value to pull out, written as a dot-separated path: 'label' for a top-level key, 'objects.0.name' to step into nested objects and array indexes.\nEmpty returns the input text untouched on all five outputs - the node becomes a no-op, which is handy when the model already answers with a bare value.\nA missing key does not raise: you get 'default' instead."
+                }),
+                "default": ("STRING", {
+                    "default": "",
+                    "tooltip": "Fallback text returned when the key path does not exist (e.g. write 'false' or '0' so the boolean/int outputs are meaningful rather than 0 / False by accident).\nIt is converted like any other value, so keep it as plain text."
+                }),
             },
         }
     
+    DESCRIPTION = (
+        "Reads a value out of the JSON a language model produced, by dot-separated key path, and "
+        "exposes it already converted to Any, String, Int, Float or Boolean - so a VLM answer can set a "
+        "seed, flip a switch, choose a count or supply text to the next node.\n"
+        "Missing keys - and input that is not valid JSON at all - fall back to 'default' instead of "
+        "failing the run, so put a sensible value there for anything critical."
+    )
     RETURN_TYPES = (any_type, "STRING", "INT", "FLOAT", "BOOLEAN")
     RETURN_NAMES = ("any", "string", "int", "float", "boolean")
+    OUTPUT_TOOLTIPS = (
+        "any: the extracted value in its native JSON type - string, number, true/false, list, object or "
+        "null - accepted by any input socket thanks to the wildcard type.\n"
+        "This is the only output that preserves lists and objects intact.",
+        "string: the value rendered as text (str() of it, null becoming '').\n"
+        "Numbers and booleans become readable text; a list or object arrives as its JSON-ish "
+        "representation, so 'Unpack Code Block' / Parse JSON again may read it better.",
+        "int: the value cast to a whole number. Anything that is not numeric - text, null, a list - "
+        "yields 0, so set a numeric 'default' if 0 would be a valid answer.\n"
+        "Floats are truncated towards zero.",
+        "float: the value cast to a decimal number, 0.0 when it is not numeric.\n"
+        "Booleans come through as 1.0 / 0.0.",
+        "boolean: the value as true/false. Real JSON booleans pass straight through; anything else is "
+        "true only when its text form reads exactly 'true' (case-insensitive), so 1 becomes False - put "
+        "'true'/'false' in 'default' when the key may be missing.",
+    )
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1451,15 +2084,33 @@ class remove_code_block:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "input": ("STRING", {"forceInput": True}),
+                "input": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "The model's raw text, typically an Instruct node's 'output' that came back wrapped in a Markdown code fence (```json ... ``` / ``` ... ```).\nIf a LIST of strings arrives it is joined with newlines into one text first, so use Parse JSON / output_list instead when you need the items kept apart."
+                }),
             },
             "optional": {
-                "label": ("STRING", {"default": ""}),
+                "label": ("STRING", {
+                    "default": "",
+                    "tooltip": "The language tag expected right after the opening backticks - 'json' for ```json, 'python' for ```python, and so on.\nSet it when a model also emits plain fenced code you want to keep: with a label given, a fence that does not start with exactly ```<label> is left untouched.\nEmpty strips any fence, including a bare ``` line."
+                }),
             },
         }
     
+    DESCRIPTION = (
+        "Unwraps a Markdown code block from model output, dropping the ``` fences and the language tag, "
+        "so the JSON / prompt / code inside can be handed to the next node as clean text.\n"
+        "Text that carries no fence is passed through unchanged, which makes the node safe to leave in a "
+        "graph whatever the model does."
+    )
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output",)
+    OUTPUT_TOOLTIPS = (
+        "output: the text with the surrounding code fence and its language tag removed and "
+        "leading/trailing whitespace trimmed - the raw payload, ready for 'Parse JSON', 'JSON to BBoxes' "
+        "or a prompt input.\n"
+        "Fences inside the payload are not touched, and unlabelled input is returned as it came in.",
+    )
     FUNCTION = "process"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1490,12 +2141,33 @@ class PromptEnhancerPreset:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "preset": (["Qwen-Image [EN]", "Qwen-Image [ZH]", "Qwen-Image 2512 [EN]", "Qwen-Image 2512 [ZH]", "Qwen-Image-Edit", "Qwen-Image-Edit 2509", "Qwen-Image-Edit 2511", "Z-Image Turbo", "Flux.2 T2I", "Flux.2 I2I", "Wan T2V [EN]", "Wan T2V [ZH]", "Wan I2V [EN]", "Wan I2V [ZH]", "Wan I2V Full-Auto [EN]", "Wan I2V Full-Auto [ZH]", "Wan FLF2V [EN]", "Wan FLF2V [ZH]"], )
+                "preset": (["Qwen-Image [EN]", "Qwen-Image [ZH]", "Qwen-Image 2512 [EN]", "Qwen-Image 2512 [ZH]", "Qwen-Image-Edit", "Qwen-Image-Edit 2509", "Qwen-Image-Edit 2511", "Z-Image Turbo", "Flux.2 T2I", "Flux.2 I2I", "Wan T2V [EN]", "Wan T2V [ZH]", "Wan I2V [EN]", "Wan I2V [ZH]", "Wan I2V Full-Auto [EN]", "Wan I2V Full-Auto [ZH]", "Wan FLF2V [EN]", "Wan FLF2V [ZH]"], {
+                    "tooltip": "Pick the enhancement persona matching the generation model you are driving, because each one is written for a specific prompt format.\n"
+                               "Text-to-image: Qwen-Image / Qwen-Image 2512 rewrite a short idea into a complete image prompt; Z-Image Turbo writes a dense Chinese visual description; Flux.2 T2I keeps the intent and adds description.\n"
+                               "Image editing: Qwen-Image-Edit / 2509 / 2511 and Flux.2 I2I rewrite an edit instruction into what that editor expects (2511 is the newer enhancer style).\n"
+                               "Video: Wan T2V adds cinematic language ([EN] forces English output), Wan I2V rewrites a motion description while looking at your first frame, Wan I2V Full-Auto invents the motion from the image alone, Wan FLF2V writes for first-and-last-frame conditioning.\n"
+                               "[EN] / [ZH] select the output language of the rewritten prompt - choose the one your diffusion model understands."
+                })
             }
         }
     
+    DESCRIPTION = (
+        "Returns a ready-made system prompt that turns a chat model in 'Llama-cpp Instruct' into a "
+        "prompt enhancer for one specific generation model (Qwen-Image, Z-Image Turbo, Flux.2, Wan, "
+        "and their image/video-editing variants): the persona, the required output format and the "
+        "examples are all baked in.\n"
+        "Connect the output to the Instruct node's system_prompt, put your rough idea in custom_prompt, "
+        "connect the reference image when the preset is an I2I / I2V one, and feed the answer to the "
+        "sampler."
+    )
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("system_prompt",)
+    OUTPUT_TOOLTIPS = (
+        "system_prompt: the full instruction sheet of the chosen preset as one long STRING - role, the "
+        "rules for the rewrite, output-format requirements and few-shot examples.\n"
+        "Connect it to 'Llama-cpp Instruct' -> system_prompt (not to custom_prompt: this is the persona, "
+        "your idea goes in custom_prompt). Nothing else is produced here, no model is called.",
+    )
     FUNCTION = "main"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1588,18 +2260,41 @@ class llama_cpp_text_encoder:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "llama_model": ("LLAMACPPMODEL",),
-                "prompt": ("STRING", {"multiline": True, "default": "", "dynamicPrompts": True}),
-                "type": (list(s.PRESETS.keys()), {"default": "Z-Image"}),
+                "llama_model": ("LLAMACPPMODEL", {
+                    "tooltip": "The 'llama_model' output of a 'Llama-cpp Model Loader', with the LLM whose hidden states the target model expects (Qwen-Image, Lumina2-style, Boogu, JoyImage, ...). Load it with 'embeddings' friendly settings: no mmproj is needed, and n_ctx only has to cover the prompt.\nThis node hot-swaps the shared context into embeddings mode and 'Llama-cpp Instruct' swaps it back, so alternating the two rebuilds the context instead of reloading the weights."
+                }),
+                "prompt": ("STRING", {"multiline": True, "default": "", "dynamicPrompts": True,
+                    "tooltip": "The text to encode - your positive prompt, or the output of a prompt-enhancer chain.\nIt is wrapped in the chat template of the chosen 'type' before being fed through the LLM, so write it the way you would write to that model's own encoder (a natural visual description, not tags, unless the target model wants tags).\nDynamic-prompt wildcards like <cat|dog> are expanded by the frontend before encoding."
+                }),
+                "type": (list(s.PRESETS.keys()), {
+                    "default": "Z-Image",
+                    "tooltip": "Which diffusion model this conditioning is for. The choice fixes three things at once: the chat template wrapped around your prompt, which transformer layer the hidden states are read from (-1 = last, -2 = second-to-last, a fixed number for MiniMax), and whether the template tokens are trimmed off the result.\nPick the entry matching the model that consumes the conditioning - a mismatch encodes into the wrong feature space and yields garbage (or nonsense) images. Each entry mirrors that model's native encoder."
+                }),
                 "force_offload": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Unload the model after inference."
+                    "tooltip": "Unload the llama-cpp model from RAM/VRAM as soon as the conditioning is produced, so the diffusion model can be loaded into the freed memory.\nKeep it on when this encoder sits at the start of a sampling workflow on a small GPU; keep it off if several encoders/instruct nodes run back to back, or every one of them pays for a reload."
                 }),
             }
         }
     
+    DESCRIPTION = (
+        "Uses the loaded llama-cpp GGUF as the text encoder of an image/video model: the prompt is put "
+        "through that model's chat template, run in embedding mode, and the hidden states of a chosen "
+        "transformer layer are returned as CONDITIONING - a drop-in replacement for the native "
+        "Qwen-Image / Lumina2 / Boogu / JoyImage / Mage-Flow / MiniMax / Z-Image text encoder.\n"
+        "One LLM checkpoint can therefore serve several diffusion models; select the one whose feature "
+        "space the sampler expects via 'type'."
+    )
     RETURN_TYPES = ("CONDITIONING",)
     RETURN_NAMES = ("conditioning",)
+    OUTPUT_TOOLTIPS = (
+        "conditioning: standard ComfyUI CONDITIONING - [[hidden_states, {\"pooled_output\": zeros}]] with "
+        "hidden_states shaped [1, seq_len, hidden_dim], i.e. the LLM's per-token layer activations "
+        "(template tokens trimmed where the preset says so). MiniMax-T2V adds token tags for its "
+        "conditioning.\n"
+        "Connect to a KSampler / model that was built for that LLM's embeddings; the pooled vector is a "
+        "zero placeholder, so models needing a real pooled output will not work.",
+    )
     FUNCTION = "encode"
     CATEGORY = "llama-cpp-vlm"
     
@@ -1639,7 +2334,15 @@ class llama_cpp_text_encoder:
                 llm._ctx.memory_clear(True)
                 
         # 3. 执行推理计算
+        prefill_start = time.perf_counter()
         llm.eval(tokens)
+        prefill_s = max(0.0, time.perf_counter() - prefill_start)
+        rate = (len(tokens) / prefill_s) if prefill_s > 0 else 0.0
+        print(
+            f"[llama-cpp_vlm] [text encoder] prefill {len(tokens):,} tok in "
+            f"{prefill_s:.2f}s ({rate:.1f} tok/s)",
+            flush=True,
+        )
         
         # 4. 从上下文中提取深层特征
         ctx_ptr = getattr(llm, "ctx", None) or getattr(getattr(llm, "_ctx", None), "ctx", None)
