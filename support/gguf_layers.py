@@ -237,6 +237,14 @@ _MODEL_INFO_SUFFIXES = (
     "embedding_length",
     "context_length",
     "nextn_predict_layers",
+    # Sliding-window / hybrid attention (Gemma 3-4, Qwen3-Next, ...): the local
+    # layers keep only `sliding_window` positions, and often use their own
+    # narrower head width, so sizing them like global layers overestimates the
+    # KV cache by close to an order of magnitude.
+    "attention.sliding_window",
+    "attention.sliding_window_pattern",
+    "attention.key_length_swa",
+    "attention.value_length_swa",
 )
 
 
@@ -295,4 +303,10 @@ def get_model_info(path):
         "embedding_length": _as_int(value("embedding_length"), 0) or 0,
         "context_length": _as_int(value("context_length"), 0) or 0,
         "nextn_predict_layers": _as_int(value("nextn_predict_layers"), 0) or 0,
+        # Sliding-window attention: `sliding_window_pattern` is one flag per
+        # layer (true = local/SWA layer); absent means every layer is global.
+        "sliding_window": _as_int(value("attention.sliding_window"), 0) or 0,
+        "sliding_window_pattern": value("attention.sliding_window_pattern") or [],
+        "key_length_swa": value("attention.key_length_swa"),
+        "value_length_swa": value("attention.value_length_swa"),
     }

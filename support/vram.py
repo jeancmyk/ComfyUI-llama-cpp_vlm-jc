@@ -13,7 +13,11 @@ llama.cpp once the model is resident.
 
 GIB = 1024.0 ** 3
 
-# Bytes per cache element for the quantizations exposed by the loader.
+from . import backend
+
+# Bytes per cache element. The keys are the types llama.cpp accepts for the KV
+# cache; the weight-only quants (q2_k ... q6_k) are kept only so an old config
+# naming one still gets a sensible size after coercion.
 CACHE_TYPE_BYTES = {
     "f32": 4.0,
     "f16": 2.0,
@@ -37,7 +41,14 @@ CACHE_TYPE_BYTES = {
 
 
 def cache_element_bytes(cache_type):
-    return CACHE_TYPE_BYTES.get(str(cache_type or "f16").lower(), 2.0)
+    """Bytes per cache element for the type llama.cpp will actually use.
+
+    A weight quant (q6_k, q2_k, ...) is not a legal KV cache type; the loader
+    maps it to the closest legal one, and this uses the same mapping so the
+    pre-flight estimate and the real allocation describe the same cache.
+    """
+    name, _ = backend.coerce_kv_type(cache_type)
+    return CACHE_TYPE_BYTES.get(name, 2.0)
 
 
 def _per_layer(value, n_layer, default):
@@ -62,11 +73,18 @@ def _per_layer(value, n_layer, default):
 
 
 def estimate_kv_cache(info, n_ctx, cache_type_k="f16", cache_type_v="f16"):
-    """Estimate KV-cache bytes per context slot (sequence) for ``n_ctx``.
+    """Estimate KV-cache bytes for ``n_ctx`` tokens on one sequence.
 
-    ``info`` is the dict returned by ``gguf_layers.get_model_info``.  Models
-    with sliding-window / hybrid attention may allocate less than this; the
-    value is an upper-bound estimate and is labelled as such in the console.
+    ``info`` is the dict returned by ``gguf_layers.get_model_info``. Hybrid /
+    sliding-window models (Gemma 3-4, Qwen3-Next, ...) are sized per layer: the
+    layers flagged in ``sliding_window_pattern`` keep only ``sliding_window``
+    positions and usually use the narrower ``*_swa`` head width, which is what
+    makes a 262144-token Gemma context cheap instead of enormous. Models without
+    that metadata take the plain all-global path.
+
+    The reported ``bytes_per_token`` is the average over ``n_ctx``. It is not a
+    constant for hybrid models, so anything that wants the largest context for a
+    byte budget must call :func:`max_context_for_budget` instead of dividing.
     """
     n_layer = int(info.get("layer_count") or 0)
     n_ctx = int(n_ctx or 0)
@@ -78,6 +96,8 @@ def estimate_kv_cache(info, n_ctx, cache_type_k="f16", cache_type_v="f16"):
             "n_ctx": max(n_ctx, 0),
             "k_elem_bytes": cache_element_bytes(cache_type_k),
             "v_elem_bytes": cache_element_bytes(cache_type_v),
+            "swa_layers": 0,
+            "swa_window": 0,
         }
 
     n_head = int(info.get("head_count") or 0)
@@ -88,20 +108,78 @@ def estimate_kv_cache(info, n_ctx, cache_type_k="f16", cache_type_v="f16"):
     k_len = _per_layer(info.get("key_length"), n_layer, default_dim)
     v_len = _per_layer(info.get("value_length"), n_layer, default_dim)
 
-    k_elems = sum(h * length for h, length in zip(kv_heads, k_len))
-    v_elems = sum(h * length for h, length in zip(kv_heads, v_len))
+    window = int(info.get("sliding_window") or 0)
+    pattern = info.get("sliding_window_pattern") or []
+    k_len_swa = _per_layer(info.get("key_length_swa"), n_layer, 0)
+    v_len_swa = _per_layer(info.get("value_length_swa"), n_layer, 0)
 
     k_elem_bytes = cache_element_bytes(cache_type_k)
     v_elem_bytes = cache_element_bytes(cache_type_v)
-    bytes_per_token = k_elems * k_elem_bytes + v_elems * v_elem_bytes
+
+    total = 0
+    swa_layers = 0
+    for layer in range(n_layer):
+        local = bool(window) and layer < len(pattern) and bool(pattern[layer])
+        if local:
+            # A local layer only ever holds `window` positions, whatever n_ctx
+            # is, and typically uses the narrower SWA head width.
+            swa_layers += 1
+            layer_k = k_len_swa[layer] or k_len[layer]
+            layer_v = v_len_swa[layer] or v_len[layer]
+            positions = min(n_ctx, window)
+        else:
+            layer_k, layer_v = k_len[layer], v_len[layer]
+            positions = n_ctx
+        total += kv_heads[layer] * (
+            layer_k * k_elem_bytes + layer_v * v_elem_bytes
+        ) * positions
+
+    # Global-equivalent element counts, kept for reporting/back-compat.
+    k_elems = sum(h * length for h, length in zip(kv_heads, k_len))
+    v_elems = sum(h * length for h, length in zip(kv_heads, v_len))
+
     return {
-        "bytes": int(bytes_per_token * n_ctx),
-        "bytes_per_token": bytes_per_token,
+        "bytes": int(total),
+        "bytes_per_token": int(total // n_ctx) if n_ctx else 0,
         "n_layer": n_layer,
         "n_ctx": n_ctx,
         "k_elem_bytes": k_elem_bytes,
         "v_elem_bytes": v_elem_bytes,
+        "swa_layers": swa_layers,
+        "swa_window": window if swa_layers else 0,
+        "k_elems": k_elems,
+        "v_elems": v_elems,
     }
+
+
+def max_context_for_budget(info, budget_bytes, cache_type_k="f16", cache_type_v="f16",
+                           cap=None, step=1):
+    """Largest ``n_ctx`` whose KV cache fits in ``budget_bytes``.
+
+    Solved by bisection because hybrid attention makes the cache cost
+    concave in ``n_ctx``: local layers are capped, so a straight
+    ``budget // bytes_per_token`` division would refuse context the model can
+    actually hold. Like the division it replaces, this is a *memory* answer, not
+    a claim about the architecture: it does not clamp to the checkpoint's trained
+    context, because llama.cpp handles that side itself.
+    """
+    budget = int(budget_bytes or 0)
+    if budget <= 0:
+        return 0
+    upper = int(cap or (1 << 20))
+    upper = max(1, upper)
+    if estimate_kv_cache(info, upper, cache_type_k, cache_type_v)["bytes"] <= budget:
+        return upper
+    lo, hi = 0, upper
+    while hi - lo > max(1, step):
+        mid = (lo + hi) // 2
+        if mid <= lo:
+            break
+        if estimate_kv_cache(info, mid, cache_type_k, cache_type_v)["bytes"] <= budget:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def gib(num_bytes):
