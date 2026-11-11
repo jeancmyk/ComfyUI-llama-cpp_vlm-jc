@@ -1003,9 +1003,10 @@ def image2base64(image):
     img.save(buffered, format="JPEG", quality=85)
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-def audio2base64(audio):
+def audio_to_wav_bytes(audio):
     """Encode a ComfyUI AUDIO dict ({"waveform": (B,C,N) tensor, "sample_rate": int})
-    as a base64 16-bit PCM WAV string for llama.cpp input_audio content items."""
+    into 16-bit PCM WAV bytes. Shared by llama.cpp's ``input_audio`` items and by
+    the TTS node's speaker-reference clip."""
     waveform = audio["waveform"]
     sample_rate = int(audio["sample_rate"])
     wav = waveform[0] if waveform.dim() == 3 else waveform
@@ -1020,7 +1021,11 @@ def audio2base64(audio):
         f.setsampwidth(2)
         f.setframerate(sample_rate)
         f.writeframes(interleaved)
-    return base64.b64encode(buffered.getvalue()).decode('utf-8')
+    return buffered.getvalue()
+
+def audio2base64(audio):
+    """The same WAV bytes, base64-encoded for a llama.cpp ``input_audio`` item."""
+    return base64.b64encode(audio_to_wav_bytes(audio)).decode('utf-8')
 
 def video2frames(video):
     """Decode a ComfyUI VIDEO input (e.g. from the 'Load Video' node) into an
@@ -1324,12 +1329,230 @@ class llama_cpp_model_loader:
             "cache_type_v": cache_type_v,
             "free_vram": free_vram,
             "enforce_vram": enforce_vram,
-            "skip_mmproj": skip_mmproj
+            "skip_mmproj": skip_mmproj,
+            "flash_attn": flash_attn,
+            "cpu_moe": bool(cpu_moe),
+            "n_cpu_moe": int(n_cpu_moe or 0),
+            "moe_cache_mb": int(moe_cache_mb or 0),
+            "n_batch": int(n_batch or 0),
+            "n_ubatch": int(n_ubatch or 0),
+            "spec_type": spec_type,
+            "spec_draft": spec_draft,
+            "spec_draft_n_max": int(spec_draft_n_max or 3),
         }
         if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != custom_config:
             print("[llama-cpp_vlm] Loading model...")
             LLAMA_CPP_STORAGE.load_model(custom_config)
+        # Key the applied figures to *this* node so several loaders on one canvas
+        # each report their own, and a page reload can re-read them from
+        # GET /llama_cpp/api/loader_status without another load.
+        LLAMA_CPP_STORAGE.set_loader_status(unique_id, LLAMA_CPP_STORAGE.last_report)
         return (custom_config,)
+
+class llama_cpp_tts:
+    """Speech synthesis on top of the model the Loader already has resident.
+
+    llama.cpp keeps the whole TTS chain in the **projector** file: the backbone
+    only supplies hidden states, and the mmproj decodes them into PCM. So this
+    node needs a Loader whose 'mmproj' widget names a TTS projector - a vision
+    projector will not work, and the pipeline says so when asked.
+
+    Requires a llama-cpp-python build with the mtmd audio-generation bindings
+    (0.4.x and later); the Loader reports the backend version in its status line.
+    """
+
+    # mtmd_gen_audio_type enum value -> human name.
+    TTS_FAMILIES = {
+        1: "Qwen3-TTS", 2: "Pocket TTS", 3: "Soprano",
+        4: "LFM3A", 5: "Chatterbox", 6: "Drama 3",
+    }
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "llama_model": ("LLAMACPPMODEL", {
+                    "tooltip": "The 'llama_model' output of a 'Llama-cpp Model Loader'.\nThe backbone only provides hidden states - the speech decoder comes from the Loader's 'mmproj' widget, which must name the TTS projector shipped with that checkpoint.\nRunning this node puts the shared context into embeddings mode; 'Llama-cpp Instruct' switches it back, so alternating the two does not reload the weights."
+                }),
+                "text": ("STRING", {
+                    "multiline": True, "default": "Hello, I can read your prompts out loud.",
+                    "tooltip": "The text to speak.\nDrama 3 picks its speaker from tags inside this text and infers the language from it; the other pipelines ignore tags."
+                }),
+                "voice": ("STRING", {
+                    "multiline": False, "default": "",
+                    "tooltip": "Predefined speaker name. Only Pocket TTS and Chatterbox accept one - leave empty to use the projector's default voice.\nThe names a projector actually offers appear in this node's 'report' output and in the console after the first synthesis."
+                }),
+                "language": ("STRING", {
+                    "multiline": False, "default": "auto",
+                    "tooltip": "Language hint for the pipeline ('en', 'zh', 'ja', ... depending on the model).\n'auto' or empty lets the model decide, and is what Drama 3 requires."
+                }),
+                "max_frames": ("INT", {
+                    "default": 512, "min": 2, "max": 8192, "step": 1,
+                    "tooltip": "Ceiling on generated audio frames - effectively the clip length. Soprano needs at least 2.\nIf the text needs more than this the clip is cut short and the report says finish=length."
+                }),
+                "seed": ("INT", {
+                    "default": 0, "min": 0, "max": 0xFFFFFFFF,
+                    "tooltip": "Sampling seed. Reproducible on the sampling-driven pipelines (Qwen3-TTS, Soprano, Chatterbox, Drama 3); Pocket TTS ignores it."
+                }),
+                "temperature": ("FLOAT", {
+                    "default": 0.8, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Sampling temperature for the code book.\nPocket TTS ignores the sampling settings; the others use them."
+                }),
+                "top_k": ("INT", {"default": 40, "min": -1, "max": 1024, "step": 1, "tooltip": "Top-k for the audio code book. Ignored by Pocket TTS."}),
+                "top_p": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Nucleus sampling. Must be in (0, 1]. Ignored by Pocket TTS."}),
+                "min_p": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Min-p sampling. Ignored by Pocket TTS."}),
+                "repeat_penalty": ("FLOAT", {"default": 1.05, "min": 0.0, "max": 3.0, "step": 0.01, "tooltip": "Repetition penalty for the audio tokens. Must be above 0. Ignored by Pocket TTS."}),
+                "use_gpu": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Decode the audio on the GPU.\nTurn off only to claw back VRAM for a larger context - speech decoding gets far slower."
+                }),
+            },
+            "optional": {
+                "speaker_audio": ("AUDIO", {
+                    "tooltip": "Reference clip to clone a voice from (Qwen3-TTS, Pocket TTS and Chatterbox all take one). Mutually exclusive with 'voice'.\nFeed it a few clean seconds from a 'Load Audio' node; the encoder resamples it itself."
+                }),
+            },
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("AUDIO", "STRING")
+    RETURN_NAMES = ("audio", "report")
+    OUTPUT_TOOLTIPS = (
+        "audio: a ComfyUI AUDIO dict (waveform batch x channels x samples, float32 in [-1, 1] plus "
+        "sample_rate) - connect it to 'Save Audio', an AUDIO preview, or any audio effect node.\n"
+        "report: one line naming the detected pipeline, the sample rate, the length, whether the "
+        "clip was cut short, and every predefined voice the projector offers.",
+    )
+    FUNCTION = "synthesize"
+    CATEGORY = "llama-cpp-vlm"
+
+    DESCRIPTION = (
+        "Turns text into speech with the mtmd audio-generation pipeline of a TTS checkpoint "
+        "(Qwen3-TTS, Pocket TTS, Soprano, LFM3A, Chatterbox, Drama 3 - whichever the projector ships).\n"
+        "The Loader does the loading: select the checkpoint there and put its **TTS projector** in the "
+        "'mmproj' widget, then connect its llama_model here. Needs llama-cpp-python 0.4.x or newer.\n"
+        "The clip is monophonic float32, so 'Save Audio' (wav/flac/mp3) works directly on the output."
+    )
+
+    @staticmethod
+    def _mtmd(gen):
+        """The mtmd binding module plus a live context, or (None, None)."""
+        ctx = getattr(gen, "mtmd_ctx", None)
+        return getattr(gen, "_mtmd_cpp", None), ctx
+
+    @classmethod
+    def _family(cls, gen):
+        """Which TTS pipeline the projector declares."""
+        mtmd, ctx = cls._mtmd(gen)
+        if not mtmd or not ctx:
+            return None
+        try:
+            return cls.TTS_FAMILIES.get(int(mtmd.mtmd_gen_audio_get_info(ctx).type), "unknown")
+        except Exception:
+            return None
+
+    @classmethod
+    def _voices(cls, gen):
+        """Predefined voice names. Empty until create_speech has built the mtmd
+        context, which is why the report improves after the first run."""
+        mtmd, ctx = cls._mtmd(gen)
+        if not mtmd or not ctx:
+            return []
+        try:
+            info = mtmd.mtmd_gen_audio_get_info(ctx)
+            names = []
+            for index in range(int(getattr(info, "n_voices", 0) or 0)):
+                raw = mtmd.mtmd_gen_audio_voice_name(ctx, index)
+                if raw:
+                    names.append(raw.decode("utf-8", "ignore"))
+            return names
+        except Exception:
+            return []
+
+    def synthesize(self, llama_model, text, voice, language, max_frames, seed,
+                   temperature, top_k, top_p, min_p, repeat_penalty, use_gpu=True,
+                   speaker_audio=None, unique_id=None):
+        from llama_cpp.llama_multimodal import MTMDAudioGenerator
+
+        if not text or not text.strip():
+            raise ValueError("Nothing to speak: 'text' is empty.")
+
+        llm = LLAMA_CPP_STORAGE.llm
+        if llm is None:
+            raise RuntimeError(
+                "No llama-cpp model is resident. Run the 'Llama-cpp Model Loader' connected "
+                "to this node first."
+            )
+        config = LLAMA_CPP_STORAGE.current_config or {}
+        mmproj = config.get("mmproj")
+        if mmproj in (None, "", "None") or config.get("skip_mmproj"):
+            raise ValueError(
+                "TTS lives in the projector: pick the checkpoint's TTS mmproj in the "
+                "'mmproj' widget of the connected 'Llama-cpp Model Loader' (and leave "
+                "'skip_mmproj' off). A vision projector will not speak."
+            )
+        mmproj_path = folder_paths.get_full_path("LLM", mmproj) \
+            or os.path.join(folder_paths.models_dir, "LLM", mmproj)
+        if not os.path.isfile(mmproj_path):
+            raise FileNotFoundError(f"TTS projector not found: {mmproj_path}")
+
+        # The audio pipeline refuses anything but embeddings=True + pooling NONE.
+        LLAMA_CPP_STORAGE.ensure_tts_context()
+
+        cache_key = (str(mmproj_path), bool(use_gpu))
+        gen = LLAMA_CPP_STORAGE.audio_gen
+        if gen is None or LLAMA_CPP_STORAGE.audio_gen_key != cache_key:
+            LLAMA_CPP_STORAGE.close_audio_generator()
+            gen = MTMDAudioGenerator(mmproj_path=mmproj_path, verbose=False,
+                                     use_gpu=bool(use_gpu))
+            LLAMA_CPP_STORAGE.audio_gen = gen
+            LLAMA_CPP_STORAGE.audio_gen_key = cache_key
+
+        reference = audio_to_wav_bytes(speaker_audio) if speaker_audio is not None else None
+        speaker = (voice or "").strip() or None
+        lang = None if (language or "").strip().lower() in ("", "auto") else language.strip()
+
+        try:
+            # The bridge makes ComfyUI's cancel button stop decoding (the helper
+            # checks llama._abort_event between frames) instead of running to
+            # max_frames; the generation lock keeps the OpenAI endpoint out.
+            with GENERATION_LOCK:
+                with _LlamaCancelBridge("tts"):
+                    audio = gen.create_speech(
+                        llama=llm, text=text, language=lang,
+                        speaker_reference=reference, voice=speaker,
+                        response_format="pcm_f32", max_frames=int(max_frames),
+                        seed=int(seed) & 0xFFFFFFFF, temperature=float(temperature),
+                        top_k=int(top_k), top_p=float(top_p), min_p=float(min_p),
+                        repeat_penalty=float(repeat_penalty),
+                    )
+        except InterruptedError:
+            raise
+        except ValueError as exc:
+            names = self._voices(gen)
+            hint = f" - voices this projector offers: {', '.join(names)}" if names else ""
+            raise ValueError(f"TTS refused the request: {exc}{hint}") from exc
+
+        # ComfyUI AUDIO: (batch, channels, samples) float32. pcm_f32 comes back
+        # native-endian mono, so no container parsing is needed at all. The copy
+        # matters: frombuffer is read-only, and downstream audio nodes write
+        # into the waveform they are handed.
+        samples = np.frombuffer(audio.data, dtype=np.float32)
+        if samples.size == 0:
+            raise RuntimeError("TTS produced no samples.")
+        waveform = torch.from_numpy(samples.copy().reshape(1, audio.channels, samples.size))
+        report = (
+            f"{self._family(gen) or 'TTS'} | {audio.sample_rate} Hz | "
+            f"{audio.duration:.2f} s ({samples.size} samples, {audio.channels} ch) | "
+            f"finish={audio.finish_reason}"
+        )
+        names = self._voices(gen)
+        report += f" | voices: {', '.join(names)}" if names else " | voices: none predefined"
+        print(f"[llama-cpp_vlm] TTS {report}")
+        if audio.finish_reason == "length":
+            print(f"[llama-cpp_vlm] TTS: clip hit max_frames={int(max_frames)} - raise it for the "
+                  "full sentence.")
+        return ({"waveform": waveform, "sample_rate": int(audio.sample_rate)}, report)
 
 class llama_cpp_instruct_adv:
     @classmethod
@@ -2900,6 +3123,7 @@ class llama_cpp_text_encoder:
 
 NODE_CLASS_MAPPINGS = {
     "llama_cpp_model_loader": llama_cpp_model_loader,
+    "llama_cpp_tts": llama_cpp_tts,
     "llama_cpp_instruct_adv": llama_cpp_instruct_adv,
     "llama_cpp_parameters": llama_cpp_parameters,
     "llama_cpp_unload_model": llama_cpp_unload_model,
@@ -2916,6 +3140,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "llama_cpp_model_loader": "Llama-cpp Model Loader",
+    "llama_cpp_tts": "Llama-cpp TTS (Speech)",
     "llama_cpp_instruct_adv": "Llama-cpp Instruct",
     "llama_cpp_parameters": "Llama-cpp Parameters",
     "llama_cpp_unload_model": "Llama-cpp Unload Model",
