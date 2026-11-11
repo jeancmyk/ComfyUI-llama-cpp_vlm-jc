@@ -5,3 +5,8 @@ checkpoints/
 *.egg-info
 .pytest_cache
 .DS_Store
+# endpoint state (user configuration / saved conversations)
+api_models.json
+api_sessions/
+# local backups of the above - never history
+*.bak
