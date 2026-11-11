@@ -17,7 +17,9 @@ from scipy.ndimage import gaussian_filter
 from .support.cqdm import cqdm
 from .support.gguf_layers import get_layer_count, get_model_info
 from .support.vram import estimate_kv_cache, fmt_gib, GIB
+from .support import backend
 from .support.inference_stats import InferenceStats
+from .support.runtime import GENERATION_LOCK
 from .support.prompt_enhancer_preset import *
 from .support.reasoning import (
     ReasoningSpec, GENERIC_SPEC, resolve_reasoning_spec, parse_custom_tags, split_reasoning
@@ -128,6 +130,60 @@ class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
 
+
+
+def get_chat_handler(chat_handler):
+    match chat_handler:
+        case "Qwen3.5"|"Qwen3.5-Thinking"|"Qwen3.6"|"Qwen3.6-Thinking"|"Qwen3.8"|"Qwen3.8-Thinking":
+            return Qwen35ChatHandler
+        case "Qwen3-VL"|"Qwen3-VL-Thinking":
+            return Qwen3VLChatHandler
+        case "Qwen3-ASR":
+            return Qwen3ASRChatHandler
+        case "Qwen2.5-VL"|"MinerU2.5-Pro":
+            return Qwen25VLChatHandler
+        case "LLaVA-1.5":
+            return Llava15ChatHandler
+        case "LLaVA-1.6":
+            return Llava16ChatHandler
+        case "Moondream2":
+            return MoondreamChatHandler
+        case "nanoLLaVA":
+            return NanoLlavaChatHandler
+        case "llama3-Vision-Alpha":
+            return Llama3VisionAlphaChatHandler
+        case "MiniCPM-v2.6":
+            return MiniCPMv26ChatHandler
+        case "MiniCPM-v4.5"|"MiniCPM-v4.5-Thinking":
+            return MiniCPMv45ChatHandler
+        case "MiniCPM-v4.6"|"MiniCPM-v4.6-Thinking":
+            return MiniCPMV46ChatHandler
+        case "Gemma3":
+            return Gemma3ChatHandler
+        case "Gemma4":
+            return Gemma4ChatHandler
+        case "GLM-4.6V"|"GLM-4.6V-Thinking":
+            return GLM46VChatHandler
+        case "GLM-4.1V-Thinking":
+            return GLM41VChatHandler
+        case "LFM2-VL":
+            return LFM2VLChatHandler
+        case "LFM2.5-VL":
+            return LFM25VLChatHandler
+        case "Granite-Docling":
+            return GraniteDoclingChatHandler
+        case "DeepSeek-OCR":
+            return MTMDChatHandler
+        case "PaddleOCR-VL-1.5":
+            return PaddleOCRChatHandler
+        case "Step3-VL":
+            return Step3VLChatHandler
+        case "None":
+            return None
+        case _:
+            raise ValueError(f'Unknown model type: "{chat_handler}"')
+
+
 class LLAMA_CPP_STORAGE:
     llm = None
     chat_handler = None
@@ -136,6 +192,13 @@ class LLAMA_CPP_STORAGE:
     reasoning_spec = None
     messages = {}
     sys_prompts = {}
+    # What the loader actually applied, keyed by loader node id. This used to
+    # exist only in the console; js/loader_ux.js renders it on the node itself.
+    loader_status = {}
+    last_report = {}
+    # One cached mtmd speech generator, tied to the resident model's projector.
+    audio_gen = None
+    audio_gen_key = None
     
     @classmethod
     def ensure_embedding_mode(cls, enable_embeddings: bool):
@@ -182,6 +245,134 @@ class LLAMA_CPP_STORAGE:
         cls.current_embedding_mode = enable_embeddings
 
     @classmethod
+    def close_audio_generator(cls):
+        """Drop the cached speech generator - it is tied to the old projector."""
+        gen, cls.audio_gen, cls.audio_gen_key = cls.audio_gen, None, None
+        if gen is None:
+            return
+        try:
+            gen.close()
+        except Exception:
+            pass
+
+    @classmethod
+    def ensure_tts_context(cls):
+        """Put the shared context into the shape the mtmd TTS pipeline demands.
+
+        Speech synthesis refuses to run unless ``embeddings=True`` **and**
+        ``pooling_type=NONE``: it reads the hidden states itself, and a pooling
+        mode would have llama.cpp collapse them into a single vector. Rebuilt at
+        most once per model, using the same in-place trick as
+        ``ensure_embedding_mode`` so the weights are never read from disk again.
+        """
+        import llama_cpp
+        if not cls.llm or getattr(cls.llm, "_ctx", None) is None:
+            raise RuntimeError(
+                "No llama-cpp model is loaded. Run a 'Llama-cpp Model Loader' first, "
+                "with the TTS projector selected in its 'mmproj' widget."
+            )
+        ctx = cls.llm._ctx
+        try:
+            pooling = ctx.pooling_type()
+        except Exception:
+            pooling = None
+        if getattr(cls, "current_embedding_mode", False) and pooling == llama_cpp.LLAMA_POOLING_TYPE_NONE:
+            return
+        params = getattr(ctx, "params", None)
+        if params is None:
+            params = llama_cpp.llama_context_default_params()
+        if cls.current_config and hasattr(params, "n_ctx"):
+            params.n_ctx = int(cls.current_config.get("n_ctx") or params.n_ctx)
+        if hasattr(params, "embeddings"):
+            params.embeddings = True
+        if hasattr(params, "pooling_type"):
+            params.pooling_type = llama_cpp.LLAMA_POOLING_TYPE_NONE
+        try:
+            ctx.close()
+        except Exception:
+            pass
+        cls.llm._ctx = type(ctx)(model=cls.llm._model, params=params, verbose=False)
+        cls.current_embedding_mode = True
+
+    @classmethod
+    def collect_report(cls, config, load_seconds=None):
+        """Read back what llama.cpp really applied, as a JSON-safe dict.
+
+        The point is the *applied* values, not the requested ones: a KV type the
+        cache cannot use gets coerced, and quantized KV forces flash attention
+        on. Those are exactly the things a graph cannot otherwise see.
+        """
+        report = {
+            "model": config.get("model"),
+            "mmproj": config.get("mmproj"),
+            "chat_handler": config.get("chat_handler"),
+            "n_ctx_requested": int(config.get("n_ctx") or 0),
+            "cache_requested": "%s/%s" % (config.get("cache_type_k", "f16"),
+                                          config.get("cache_type_v", "f16")),
+            "flash_attn_requested": config.get("flash_attn", "auto"),
+            "spec_type": config.get("spec_type", "none") or "none",
+            "spec_draft": config.get("spec_draft", "None"),
+            "cpu_moe": bool(config.get("cpu_moe", False)),
+            "n_cpu_moe": int(config.get("n_cpu_moe") or 0),
+            "moe_cache_mb": int(config.get("moe_cache_mb") or 0),
+            "load_seconds": round(float(load_seconds), 2) if load_seconds else None,
+        }
+        llm = cls.llm
+        if llm is None:
+            return report
+        try:
+            report["n_ctx_applied"] = int(llm.n_ctx())
+        except Exception:
+            pass
+        try:
+            seq = getattr(llm, "n_ctx_seq", None)
+            if callable(seq):
+                report["n_ctx_seq"] = int(seq())
+        except Exception:
+            pass
+        try:
+            nextn = getattr(llm, "n_layer_nextn", None)
+            if callable(nextn):
+                report["nextn_layers"] = int(nextn())
+        except Exception:
+            pass
+        applied_k = applied_v = None
+        try:
+            params = getattr(llm, "context_params", None)
+            if params is not None:
+                applied_k = backend.kv_name(getattr(params, "type_k", None))
+                applied_v = backend.kv_name(getattr(params, "type_v", None))
+                report["cache_applied"] = "%s/%s" % (applied_k, applied_v)
+                report["cache_coerced"] = report["cache_applied"] != report["cache_requested"]
+                report["flash_attn_applied"] = backend.flash_attn_label(
+                    getattr(params, "flash_attn_type", getattr(params, "flash_attn", "n/a"))
+                )
+        except Exception:
+            pass
+        try:
+            import llama_cpp
+            report["weights_gib"] = round(
+                llama_cpp.llama_model_size(llm.model) / 1024 ** 3, 2)
+        except Exception:
+            pass
+        try:
+            if applied_k and applied_v:
+                info = get_model_info(os.path.join(folder_paths.models_dir, "LLM", config["model"]))
+                ctx_tokens = report.get("n_ctx_applied") or report["n_ctx_requested"]
+                report["kv_gib_estimate"] = round(
+                    estimate_kv_cache(info, ctx_tokens, applied_k, applied_v)["bytes"] / 1024 ** 3, 2)
+        except Exception:
+            pass
+        return report
+
+    @classmethod
+    def set_loader_status(cls, node_id, report):
+        """Remember a loader's applied settings for the browser extension."""
+        if node_id is None:
+            return
+        cls.loader_status[str(node_id)] = dict(report)
+
+    @classmethod
     def clean_state(cls, id=-1):
         if id == -1:
             cls.messages.clear()
@@ -216,59 +407,10 @@ class LLAMA_CPP_STORAGE:
     
     @classmethod
     def load_model(cls, config):
-        def get_chat_handler(chat_handler):
-            match chat_handler:
-                case "Qwen3.5"|"Qwen3.5-Thinking"|"Qwen3.6"|"Qwen3.6-Thinking"|"Qwen3.8"|"Qwen3.8-Thinking":
-                    return Qwen35ChatHandler
-                case "Qwen3-VL"|"Qwen3-VL-Thinking":
-                    return Qwen3VLChatHandler
-                case "Qwen3-ASR":
-                    return Qwen3ASRChatHandler
-                case "Qwen2.5-VL"|"MinerU2.5-Pro":
-                    return Qwen25VLChatHandler
-                case "LLaVA-1.5":
-                    return Llava15ChatHandler
-                case "LLaVA-1.6":
-                    return Llava16ChatHandler
-                case "Moondream2":
-                    return MoondreamChatHandler
-                case "nanoLLaVA":
-                    return NanoLlavaChatHandler
-                case "llama3-Vision-Alpha":
-                    return Llama3VisionAlphaChatHandler
-                case "MiniCPM-v2.6":
-                    return MiniCPMv26ChatHandler
-                case "MiniCPM-v4.5"|"MiniCPM-v4.5-Thinking":
-                    return MiniCPMv45ChatHandler
-                case "MiniCPM-v4.6"|"MiniCPM-v4.6-Thinking":
-                    return MiniCPMV46ChatHandler
-                case "Gemma3":
-                    return Gemma3ChatHandler
-                case "Gemma4":
-                    return Gemma4ChatHandler
-                case "GLM-4.6V"|"GLM-4.6V-Thinking":
-                    return GLM46VChatHandler
-                case "GLM-4.1V-Thinking":
-                    return GLM41VChatHandler
-                case "LFM2-VL":
-                    return LFM2VLChatHandler
-                case "LFM2.5-VL":
-                    return LFM25VLChatHandler
-                case "Granite-Docling":
-                    return GraniteDoclingChatHandler
-                case "DeepSeek-OCR":
-                    return MTMDChatHandler
-                case "PaddleOCR-VL-1.5":
-                    return PaddleOCRChatHandler
-                case "Step3-VL":
-                    return Step3VLChatHandler
-                case "None":
-                    return None
-                case _:
-                    raise ValueError(f'Unknown model type: "{chat_handler}"')
-        
         cls.clean(all=True)
         InferenceStats.reset()
+        # Any cached speech generator points at the model being replaced.
+        cls.close_audio_generator()
         cls.current_config = config.copy()
         model = config["model"]
         mmproj = config["mmproj"]
@@ -282,8 +424,23 @@ class LLAMA_CPP_STORAGE:
         load_mtp = config.get("load_mtp", False)
         free_vram = config.get("free_vram", True)
         enforce_vram = config.get("enforce_vram", False)
-        cache_type_k = config.get("cache_type_k", "f16")
-        cache_type_v = config.get("cache_type_v", "f16")
+        # llama.cpp's KV cache only accepts a bare set of element types; an old
+        # config asking for a weight quant (q6_k, ...) is mapped to the closest
+        # legal one so the VRAM estimate and the real allocation agree.
+        cache_type_k, kv_note_k = backend.coerce_kv_type(config.get("cache_type_k", "f16"))
+        cache_type_v, kv_note_v = backend.coerce_kv_type(config.get("cache_type_v", "f16"))
+        for note in (kv_note_k, kv_note_v):
+            if note:
+                print(f"[llama-cpp_vlm] KV cache: {note}")
+        flash_attn_mode = str(config.get("flash_attn", "auto") or "auto")
+        cpu_moe = bool(config.get("cpu_moe", False))
+        n_cpu_moe = int(config.get("n_cpu_moe", 0) or 0)
+        moe_cache_mb = int(config.get("moe_cache_mb", 0) or 0)
+        n_batch = int(config.get("n_batch", 0) or 0)
+        n_ubatch = int(config.get("n_ubatch", 0) or 0)
+        spec_type = str(config.get("spec_type", "none") or "none")
+        spec_draft = config.get("spec_draft", "None")
+        spec_n_max = int(config.get("spec_draft_n_max", 3) or 3)
         n_gpu_layers = -1
 
         model_path = os.path.join(folder_paths.models_dir, 'LLM', model)
@@ -346,19 +503,31 @@ class LLAMA_CPP_STORAGE:
             f"{gguf_layers} layers, ~{kv_cache['bytes_per_token'] / 1024:.1f} KiB/token)"
         )
 
-        mtp_supported = "load_mtp" in inspect.signature(Llama.__init__).parameters
+        # --- speculative decoding -------------------------------------------
+        # load_mtp stays as a legacy alias for spec_type="mtp": on a backend
+        # without a speculative engine it only loads the nextn weights, which
+        # costs VRAM and speeds nothing up, so the console says which of the
+        # two situations applies.
+        mtp_supported = backend.supports("load_mtp")
         mtp_nextn = int(model_info.get("nextn_predict_layers") or 0)
-        if load_mtp and not mtp_supported:
-            raise RuntimeError('"load_mtp" is unavailable! Please upgrade your llama-cpp-python.')
-        if not mtp_supported:
-            print("[llama-cpp_vlm] MTP: unavailable in this llama-cpp-python build (no load_mtp)")
-        elif not load_mtp:
+        if str(spec_type).strip().lower() in ("", "none") and load_mtp:
+            spec_type = "mtp"
+        spec_draft_path = None
+        if spec_draft not in (None, "None", ""):
+            spec_draft_path = os.path.join(folder_paths.models_dir, 'LLM', spec_draft)
+            if not os.path.isfile(spec_draft_path):
+                raise FileNotFoundError(f"spec_draft not found: {spec_draft_path}")
+        spec_config, spec_note = backend.build_spec(
+            spec_type, draft_path=spec_draft_path, n_max=spec_n_max
+        )
+        spec_active = spec_config is not None
+        if spec_active:
+            print(f"[llama-cpp_vlm] Speculative decoding: {spec_note}")
+        elif str(spec_type).strip().lower() not in ("", "none"):
             extra = f"; model has {mtp_nextn} nextn layer(s)" if mtp_nextn else ""
-            print(f"[llama-cpp_vlm] MTP: not requested{extra}")
-        else:
-            extra = (f"; model has {mtp_nextn} nextn layer(s)" if mtp_nextn
-                     else "; model reports no nextn layers")
-            print(f"[llama-cpp_vlm] MTP: requested{extra}")
+            print(f"[llama-cpp_vlm] Speculative decoding: {spec_note}{extra}")
+        if not spec_active and load_mtp and not mtp_supported:
+            raise RuntimeError('"load_mtp" is unavailable! Please upgrade your llama-cpp-python.')
 
         if vram_limit == -1:
             print(
@@ -456,6 +625,7 @@ class LLAMA_CPP_STORAGE:
                 cls.chat_handler = None
 
         print(f"[llama-cpp_vlm] Loading model: {model}")
+        print(f"[llama-cpp_vlm] Backend: {backend.describe()}")
         print(f"[llama-cpp_vlm] n_gpu_layers = {n_gpu_layers}")
         kwargs = {
             "model_path": model_path,
@@ -463,11 +633,65 @@ class LLAMA_CPP_STORAGE:
             "n_gpu_layers": n_gpu_layers,
             "n_ctx": n_ctx,
             "verbose": False,
-            "cache_type_k": cache_type_k,
-            "cache_type_v": cache_type_v,
         }
-        if mtp_supported:
-            kwargs["load_mtp"] = load_mtp
+
+        # KV cache quantization. The constructor wants GGMLType ints under
+        # type_k/type_v; the old "cache_type_k" string was swallowed by
+        # **kwargs, so the cache stayed f16 while the console reported a
+        # quantized estimate.
+        type_k_value = backend.kv_type_value(cache_type_k)
+        type_v_value = backend.kv_type_value(cache_type_v)
+        if backend.supports("type_k", "type_v") and None not in (type_k_value, type_v_value):
+            kwargs["type_k"] = type_k_value
+            kwargs["type_v"] = type_v_value
+        else:
+            print("[llama-cpp_vlm] KV cache: this backend cannot set type_k/type_v; cache stays f16")
+
+        # Flash attention decides whether a quantized KV cache is usable at all.
+        fa_value, fa_note = backend.effective_flash_attn(
+            flash_attn_mode, cache_type_k, cache_type_v
+        )
+        fa_key = next(
+            (key for key in ("flash_attn_type", "flash_attn") if backend.supports(key)), None
+        )
+        if fa_value is not None and fa_key is not None:
+            kwargs[fa_key] = fa_value
+        fa_label = backend.flash_attn_name(flash_attn_mode)
+        print(f"[llama-cpp_vlm] Flash attention: {fa_label}"
+              + (f" ({fa_note})" if fa_note else ""))
+
+        # Mixture-of-Experts offload: keeps expert weights in system RAM so the
+        # attention stack (and more layers) stay on the GPU.
+        if cpu_moe or n_cpu_moe > 0:
+            if backend.supports("cpu_moe", "n_cpu_moe"):
+                kwargs["cpu_moe"] = cpu_moe
+                kwargs["n_cpu_moe"] = n_cpu_moe
+                print(f"[llama-cpp_vlm] MoE offload: all_experts={cpu_moe}, "
+                      f"first_n_layers={n_cpu_moe}")
+            else:
+                print("[llama-cpp_vlm] MoE offload: not supported by this backend")
+
+        if moe_cache_mb > 0:
+            if backend.supports("moe_cache_size"):
+                kwargs["moe_cache_size"] = moe_cache_mb * 1024 * 1024
+                print(f"[llama-cpp_vlm] MoE expert cache: {moe_cache_mb} MiB on device")
+            else:
+                print("[llama-cpp_vlm] MoE expert cache: not supported by this backend "
+                      "(needs llama-cpp-python >= 0.4.x)")
+
+        for key, value in (("n_batch", n_batch), ("n_ubatch", n_ubatch)):
+            if value > 0 and backend.supports(key):
+                kwargs[key] = value
+        print(f"[llama-cpp_vlm] Prefill batch: "
+              f"{kwargs.get('n_batch', 'default')} logical / "
+              f"{kwargs.get('n_ubatch', 'default')} physical")
+
+        if spec_active:
+            kwargs["speculative"] = spec_config
+        elif mtp_supported:
+            # No speculative engine in this build: keep the old behaviour (loads
+            # the nextn layers) rather than silently ignoring the request.
+            kwargs["load_mtp"] = bool(load_mtp)
 
         load_start = time.perf_counter()
         cls.llm = Llama(**kwargs)
@@ -485,7 +709,42 @@ class LLAMA_CPP_STORAGE:
             print(f"[llama-cpp_vlm] Loaded in {load_s:.2f}s "
                   f"(actual sizes unavailable: {e})")
 
-        if load_mtp and mtp_supported:
+        # Prove the options landed instead of trusting the request: read back
+        # what the context was actually constructed with. A silent fallback
+        # (e.g. f16 cache because type_k never arrived) is the exact failure
+        # this reporting exists to catch.
+        try:
+            ctx_params = getattr(cls.llm, "context_params", None)
+            if ctx_params is not None:
+                applied_k = backend.kv_name(getattr(ctx_params, "type_k", None))
+                applied_v = backend.kv_name(getattr(ctx_params, "type_v", None))
+                applied_fa = getattr(
+                    ctx_params, "flash_attn_type", getattr(ctx_params, "flash_attn", "n/a")
+                )
+                applied_fa = backend.flash_attn_label(applied_fa)
+                requested_ok = (applied_k == cache_type_k and applied_v == cache_type_v)
+                print(
+                    f"[llama-cpp_vlm] Applied KV cache: k={applied_k} v={applied_v}"
+                    + ("" if requested_ok else f" (requested {cache_type_k}/{cache_type_v})")
+                    + f" | flash_attn={applied_fa}"
+                )
+                if not requested_ok:
+                    print(
+                        "[llama-cpp_vlm] WARNING: the requested KV cache types are not "
+                        "what llama.cpp applied - the VRAM estimate above will be optimistic."
+                    )
+            seq_ctx = getattr(cls.llm, "n_ctx_seq", None)
+            if callable(seq_ctx):
+                print(
+                    f"[llama-cpp_vlm] Context capacity: {cls.llm.n_ctx()} total tokens, "
+                    f"{seq_ctx()} per sequence"
+                )
+        except Exception as e:
+            print(f"[llama-cpp_vlm] (applied-context report unavailable: {e})")
+
+        if spec_active:
+            print("[llama-cpp_vlm] Speculative decoding: engine attached")
+        elif load_mtp and mtp_supported:
             try:
                 active_nextn = int(cls.llm.n_layer_nextn())
                 nextn_probe_ok = True
@@ -493,7 +752,10 @@ class LLAMA_CPP_STORAGE:
                 active_nextn = 0
                 nextn_probe_ok = False
             if active_nextn > 0:
-                print(f"[llama-cpp_vlm] MTP: loaded/active ({active_nextn} nextn layer(s))")
+                print(
+                    f"[llama-cpp_vlm] MTP: {active_nextn} nextn layer(s) loaded but no "
+                    "speculative engine in this build - extra VRAM, no speedup"
+                )
             elif nextn_probe_ok:
                 print("[llama-cpp_vlm] MTP: requested but no nextn layer is active")
             else:
@@ -523,6 +785,14 @@ class LLAMA_CPP_STORAGE:
                   f"start_in_prompt={cls.reasoning_spec.start_in_prompt})")
         else:
             print("[llama-cpp_vlm] Reasoning parsing: no reasoning markers detected")
+
+        # Publish the applied figures for the browser extension and for
+        # GET /llama_cpp/api/loader_status. The console already shows these; the
+        # graph could not, which is what made silent coercion invisible.
+        try:
+            cls.last_report = cls.collect_report(config, load_s)
+        except Exception as exc:  # never fail a good load over a report
+            cls.last_report = {"model": config.get("model"), "report_error": str(exc)}
 
 class _LlamaCancelBridge:
     """Make ComfyUI's cancel button reach llama.cpp generation.
@@ -622,17 +892,50 @@ class _LlamaCancelBridge:
             pass
 
 
+def _apply_reasoning_budget(params):
+    """Attach llama.cpp's native reasoning-budget sampler when it is requested.
+
+    The budget caps how many tokens the model may spend inside its thinking
+    block, which is the only reliable way to bound time-to-answer on a long-CoT
+    model. The delimiters come from the same reasoning spec the Instruct node
+    already resolved at load time, so the sampler and the parser agree.
+    """
+    try:
+        budget = int(params.get("reasoning_budget", -1) or -1)
+    except (TypeError, ValueError):
+        budget = -1
+    if budget < 0:
+        params.pop("reasoning_budget", None)
+        return params
+    spec = LLAMA_CPP_STORAGE.reasoning_spec
+    if spec is not None:
+        params.setdefault("reasoning_start", spec.start_tag)
+        params.setdefault("reasoning_end", spec.end_tag)
+        params.setdefault("reasoning_start_in_prompt", bool(spec.start_in_prompt))
+    else:
+        print(
+            "[llama-cpp_vlm] reasoning_budget: no reasoning markers detected for this "
+            "model; the budget sampler may not find anything to bound"
+        )
+    return params
+
+
 def _llama_completion(label, **kwargs):
     """Run create_chat_completion so ComfyUI's cancel button stops it.
 
     Also wraps the call in the live telemetry monitor (token counter +
     cumulative tok/s printed every 2 seconds, plus a prefill/decode summary).
     """
-    with _LlamaCancelBridge(label):
-        with InferenceStats.completion(label, LLAMA_CPP_STORAGE.llm) as run_stats:
-            output = LLAMA_CPP_STORAGE.llm.create_chat_completion(**kwargs)
-            run_stats.record_result(output)
-            return output
+    # One llama.cpp context exists per process and is not safe for concurrent
+    # calls, so graph generations queue behind any in-flight OpenAI request
+    # (and vice versa). Reentrant: a helper that already holds it joins in.
+    kwargs = backend.filter_completion_kwargs(kwargs, label)
+    with GENERATION_LOCK:
+        with _LlamaCancelBridge(label):
+            with InferenceStats.completion(label, LLAMA_CPP_STORAGE.llm) as run_stats:
+                output = LLAMA_CPP_STORAGE.llm.create_chat_completion(**kwargs)
+                run_stats.record_result(output)
+                return output
 
 
 def _free_vram_before_load(required_bytes, enabled):
@@ -849,6 +1152,7 @@ class llama_cpp_model_loader:
         all_llms = folder_paths.get_filename_list("LLM")
         model_list = [f for f in all_llms if "mmproj" not in f.lower()]
         mmproj_list = ["None"] + [f for f in all_llms if "mmproj" in f.lower()]
+        draft_list = ["None"] + model_list
             
         return {"required": {
             "model": (model_list, {
@@ -884,13 +1188,13 @@ class llama_cpp_model_loader:
                 "default": False,
                 "tooltip": "Load Multi-Token-Prediction (nextn) layers so the model can speculate several tokens per step - faster decode, same output.\nNeeds both a GGUF that ships nextn layers and a llama-cpp-python build exposing load_mtp; otherwise the console reports it as unavailable/not active and nothing changes."
             }),
-            "cache_type_k": (["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl"], {
+            "cache_type_k": (list(backend.KV_CACHE_TYPES), {
                 "default": "f16",
-                "tooltip": "Storage type of the KEY half of the KV cache.\n'f16' is lossless; quantized types (q8_0 down to iq2_xxs) roughly halve KV-cache VRAM per step down, at a small quality cost that grows as you go lower. Pick a smaller type to afford a bigger n_ctx on a tight GPU."
+                "tooltip": "Storage type of the KEY half of the KV cache.\n'f16' is lossless; q8_0/q5_1/q4_0 shrink the cache per step down at a small quality cost. Only types llama.cpp accepts for the KV cache are listed (weight formats such as q4_k/q6_k are not valid here).\n'auto' flash attention is forced on when either half is quantized, because quantized KV needs it."
             }),
-            "cache_type_v": (["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1", "q2_k", "q3_k", "q4_k", "q5_k", "q6_k", "iq2_xxs", "iq2_xs", "iq3_xxs", "iq1_s", "iq4_nl"], {
+            "cache_type_v": (list(backend.KV_CACHE_TYPES), {
                 "default": "f16",
-                "tooltip": "Storage type of the VALUE half of the KV cache (same trade-off as cache_type_k: less VRAM per step down, slightly more quality loss).\nValues tolerate quantization a bit better than keys, so q8_0/q4_0 here with f16 for keys is a common compromise."
+                "tooltip": "Storage type of the VALUE half of the KV cache (same trade-off as cache_type_k: less VRAM per step down, slightly more quality loss).\nValues tolerate quantization a bit better than keys, so q8_0/q4_0 here with f16 for keys is a common compromise; both halves quantized needs flash attention."
             }),
             # Appended last so old workflows keep their widget-value order.
             "free_vram": ("BOOLEAN", {
@@ -909,7 +1213,75 @@ class llama_cpp_model_loader:
                 "tooltip": "Do not load the selected mmproj projector (run text-only).\n"
                            "Image/audio inputs will be rejected until this is off and the model is reloaded."
             }),
-            }
+            # --- backend tuning (appended last: old workflows keep their order) ---
+            "flash_attn": (list(backend.FLASH_ATTN_MODES), {
+                "default": "auto",
+                "tooltip": "Flash attention: 'auto' lets llama.cpp decide, 'on'/'off' force it.\n"
+                           "Quantized KV cache requires it, so 'auto' is upgraded to 'on' whenever "
+                           "cache_type_k/cache_type_v is not f16. Longer prompts prefill faster "
+                           "with it on; a few architectures still need it off."
+            }),
+            "cpu_moe": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Keep ALL Mixture-of-Experts expert weights in system RAM and leave "
+                           "attention on the GPU (llama.cpp --cpu-moe).\n"
+                           "For MoE models whose experts dominate the file (an A3B-style model "
+                           "only activates a few billion parameters per token, so CPU experts cost "
+                           "little speed and free a lot of VRAM). Ignored by dense models."
+            }),
+            "n_cpu_moe": ("INT", {
+                "default": 0, "min": 0, "max": 256, "step": 1,
+                "tooltip": "Keep the expert weights of only the FIRST N layers in system RAM "
+                           "(llama.cpp --n-cpu-moe); 0 = disabled.\n"
+                           "The finer knob: find the smallest N that makes the load fit and keep "
+                           "the rest of the experts on the GPU. Ignored when cpu_moe is on."
+            }),
+            "moe_cache_mb": ("INT", {
+                "default": 0, "min": 0, "max": 65536, "step": 256,
+                "tooltip": "Device cache (MiB) for expert weights kept in system RAM "
+                           "(llama.cpp --moe-cache-mib); 0 = disabled.\n"
+                           "Turns repeated expert misses into cache hits, which is where most of "
+                           "the speed of a CPU-offloaded MoE comes back from. Needs a 0.4.x backend; "
+                           "older builds report it as unsupported and ignore it."
+            }),
+            "n_batch": ("INT", {
+                "default": 2048, "min": 0, "max": 16384, "step": 32,
+                "tooltip": "Logical prefill batch in tokens (llama.cpp --batch-size); 0 = backend "
+                           "default.\nBigger batches eat VRAM for compute buffers but prefetch long "
+                           "prompts and big images in fewer, fuller passes."
+            }),
+            "n_ubatch": ("INT", {
+                "default": 512, "min": 0, "max": 8192, "step": 32,
+                "tooltip": "Physical prefill batch in tokens (llama.cpp --ubatch-size); 0 = backend "
+                           "default.\nThe one that actually sizes the compute buffer: raise it for "
+                           "faster image/prefill throughput, lower it when VRAM is tight."
+            }),
+            "spec_type": (list(backend.SPEC_TYPES), {
+                "default": "none",
+                "tooltip": "Speculative decoding method - draft tokens are proposed and verified in "
+                           "one pass, so decode gets faster without changing the output.\n"
+                           "'mtp' uses the checkpoint's own nextn heads (needs an MTP-preserved GGUF); "
+                           "'dspark'/'dflash'/'eagle3' need a draft sidecar in 'spec_draft'; the "
+                           "ngram modes need no extra weights at all (they replay prompt n-grams).\n"
+                           "Needs llama-cpp-python >= 0.3.48; older builds report it as unavailable."
+            }),
+            "spec_draft": (draft_list, {
+                "default": "None",
+                "tooltip": "Draft model / sidecar GGUF for spec_type dspark, dflash or eagle3 "
+                           "(e.g. the *-drafter*.gguf shipped next to the checkpoint).\n"
+                           "'None' is correct for mtp and the ngram modes."
+            }),
+            "spec_draft_n_max": ("INT", {
+                "default": 3, "min": 1, "max": 32, "step": 1,
+                "tooltip": "Maximum number of draft tokens proposed per step.\n"
+                           "3 is the usual MTP/draft-model setting; DFlash-style drafts often take "
+                           "a larger window (7-15). Higher values only pay off if the model accepts "
+                           "most drafts - the console reports nothing, so compare tok/s."
+            }),
+            },
+            # Not a widget: lets each loader report its own applied settings to the
+            # browser extension without colliding with the single resident model.
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     DESCRIPTION = (
@@ -935,7 +1307,10 @@ class llama_cpp_model_loader:
 
     def loadmodel(self, model, mmproj, chat_handler, n_ctx, vram_limit, image_min_tokens,
                   image_max_tokens, load_mtp, cache_type_k, cache_type_v,
-                  free_vram=True, enforce_vram=False, skip_mmproj=False):
+                  free_vram=True, enforce_vram=False, skip_mmproj=False,
+                  flash_attn="auto", cpu_moe=False, n_cpu_moe=0, moe_cache_mb=0,
+                  n_batch=2048, n_ubatch=512, spec_type="none", spec_draft="None",
+                  spec_draft_n_max=3, unique_id=None):
         custom_config = {
             "model": model,
             "mmproj": mmproj,
@@ -1168,6 +1543,7 @@ class llama_cpp_instruct_adv:
         _uid = parameters.get("state_uid", None)
         _parameters = parameters.copy()
         _parameters.pop("state_uid", None)
+        _parameters = _apply_reasoning_budget(_parameters)
         uid = str(unique_id).rpartition('.')[-1] if _uid in (None, -1) else str(_uid)
         
         last_sys_prompt = LLAMA_CPP_STORAGE.sys_prompts.get(f"{uid}", None)
@@ -1474,6 +1850,75 @@ class llama_cpp_parameters:
                 "state_uid": ("INT", {
                     "default": -1, "min": -1, "max": 999999, "step": 1,
                     "tooltip": "Use a specific ID to save the conversation state.\n(-1 = use node's unique_id)\nSet the same id on two 'Llama-cpp Instruct' nodes to let them share one chat history (a follow-up question asked from a second node), or give each branch its own id to keep conversations apart.\nThe id is also what 'Llama-cpp Clean States' deletes."
+                }),
+                # --- extended samplers (appended last: old workflows keep their order) ---
+                "dry_multiplier": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 4.0, "step": 0.01,
+                    "tooltip": "DRY (Don't Repeat Yourself) strength; 0 = off.\n"
+                               "Punishes a token for extending a sequence that already repeated, "
+                               "punishing longer repeats exponentially harder - unlike "
+                               "repeat_penalty it leaves legitimately repeated boilerplate (JSON "
+                               "keys, markdown) intact. 0.8-1.2 is the usual band; it is the most "
+                               "effective cure for looping stories and roleplay."
+                }),
+                "dry_base": ("FLOAT", {
+                    "default": 1.75, "min": 1.0, "max": 4.0, "step": 0.01,
+                    "tooltip": "Growth factor of the DRY penalty per repeated token (only with "
+                               "dry_multiplier > 0). Leave at 1.75 unless you are deliberately "
+                               "tuning how fast long repeats get suppressed."
+                }),
+                "dry_allowed_length": ("INT", {
+                    "default": 2, "min": 1, "max": 16, "step": 1,
+                    "tooltip": "How many tokens a repeat may span before DRY starts penalizing it "
+                               "(only with dry_multiplier > 0). Raise it when normal text trips the "
+                               "penalty, lower it for aggressive loop breaking."
+                }),
+                "dry_penalty_last_n": ("INT", {
+                    "default": -1, "min": -1, "max": 32768, "step": 64,
+                    "tooltip": "How far back DRY scans for repeats: -1 = whole context, 0 = off.\n"
+                               "Only affects dry_multiplier > 0."
+                }),
+                "xtc_probability": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "XTC: chance per step of removing the most likely token instead of "
+                               "sampling it (0 = off, 0.5 is the documented value).\n"
+                               "Deliberately breaks the 'safest' choice, which makes creative "
+                               "writing less bland - and is a bad idea for factual, JSON or code output."
+                }),
+                "xtc_threshold": ("FLOAT", {
+                    "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "XTC only considers removing tokens whose probability is above this "
+                               "threshold (values > 0.5 effectively disable it).\n"
+                               "Only used when xtc_probability > 0."
+                }),
+                "top_n_sigma": ("FLOAT", {
+                    "default": -1.0, "min": -1.0, "max": 5.0, "step": 0.05,
+                    "tooltip": "top-n-sigma: drop candidates whose logit is more than N standard "
+                               "deviations below the best one (-1 = off).\n"
+                               "A per-step, self-scaling cut-off: it tightens an uncertain step and "
+                               "leaves a confident one alone."
+                }),
+                "min_keep": ("INT", {
+                    "default": 0, "min": 0, "max": 128, "step": 1,
+                    "tooltip": "Never let the samplers prune below this many candidates (0 = off).\n"
+                               "A safety floor for very sharp distributions, where min_p/top_p can "
+                               "otherwise leave a single token and make output deterministic."
+                }),
+                "penalty_last_n": ("INT", {
+                    "default": 64, "min": -1, "max": 32768, "step": 64,
+                    "tooltip": "How many recent tokens repeat_penalty / the two penalties look at: "
+                               "-1 = whole context, 0 = off.\n"
+                               "Only widen it if loops survive the default window."
+                }),
+                "reasoning_budget": ("INT", {
+                    "default": -1, "min": -1, "max": 16384, "step": 64,
+                    "tooltip": "Token budget for the model's thinking block (-1 = unlimited, 0 = end "
+                               "thinking immediately).\n"
+                               "Enforced inside llama.cpp's sampler, so it actually stops the CoT "
+                               "instead of hoping the model stops: the answer still arrives, with a "
+                               "bounded time-to-response. The thinking delimiters are taken from the "
+                               "model family detected at load time.\nNeeds a llama-cpp-python build "
+                               "with the reasoning-budget sampler; older ones report it as ignored."
                 }),
             }
         }
