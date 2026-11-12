@@ -326,6 +326,77 @@ async def case_knobs_affect_preview(pack):
     return ok
 
 
+async def case_recommended_params(pack):
+    """Sampling defaults come from each family's model card, not llama.cpp's."""
+    print("recommended sampling defaults")
+    api = sys.modules["llama_cpp_pack.openai_api"]
+    registry = sys.modules["llama_cpp_pack.support.model_registry"]
+    api_nodes = sys.modules["llama_cpp_pack.api_nodes"]
+
+    # Qwen3.6-35B-A3B card: thinking, general tasks
+    thinking = registry.recommended_params("Qwen3.6-Thinking")
+    ok = check("qwen thinking uses the card values",
+               thinking["temperature"] == 1.0 and thinking["top_p"] == 0.95
+               and thinking["top_k"] == 20 and thinking["min_p"] == 0.0
+               and thinking["present_penalty"] == 1.5
+               and thinking["repeat_penalty"] == 1.0, thinking)
+    ok &= check("thinking default leaves room to reason", thinking["max_tokens"] == 2048)
+
+    instruct = registry.recommended_params("Qwen3.6")
+    ok &= check("qwen non-thinking uses the instruct row",
+                instruct["temperature"] == 0.7 and instruct["top_p"] == 0.80, instruct)
+    ok &= check("thinking and instruct differ", thinking != instruct)
+
+    gemma = registry.recommended_params("Gemma4")
+    ok &= check("gemma uses google's row",
+                gemma["temperature"] == 1.0 and gemma["top_k"] == 64
+                and gemma["top_p"] == 0.95, gemma)
+    ok &= check("gemma does not invent a presence penalty",
+                "present_penalty" not in gemma, gemma)
+
+    unknown = registry.recommended_params("None")
+    ok &= check("unknown family makes no sampling claim",
+                "temperature" not in unknown and "top_k" not in unknown, unknown)
+
+    # OpenAI spelling accepted in a registry entry
+    entry = registry.normalize_entry({"model": "x.gguf",
+                                      "params": {"presence_penalty": 1.2}})
+    ok &= check("presence_penalty is aliased to present_penalty",
+                entry["params"].get("present_penalty") == 1.2, entry["params"])
+
+    # an empty params_json on the node means "model card", not "no defaults"
+    node = api_nodes.llama_cpp_api_model()
+    node.register(mode="register", api_id="params-probe",
+                  model="unsloth/Qwen3-1.7B-GGUF/Qwen3-1.7B-BF16.gguf",
+                  mmproj="None", chat_handler="Qwen3.6", n_ctx=4096, vram_limit=-1,
+                  image_min_tokens=0, image_max_tokens=0, load_mtp=False,
+                  cache_type_k="f16", cache_type_v="f16", free_vram=False,
+                  enforce_vram=False, skip_mmproj=False, params_json="")
+    saved = registry.load_registry()["models"]["params-probe"]["params"]
+    ok &= check("node fills the family defaults when the box is empty",
+                saved.get("temperature") == 0.7 and saved.get("top_k") == 20, saved)
+
+    # the request path must apply the entry's values and let a request override
+    entry = registry.normalize_entry({
+        "model": "x.gguf", "chat_handler": "Qwen3.6-Thinking",
+        "params": registry.recommended_params("Qwen3.6-Thinking")})
+    applied = api._chat_params({}, entry)
+    ok &= check("entry defaults reach the generation call",
+                applied["temperature"] == 1.0 and applied["top_k"] == 20
+                and applied["present_penalty"] == 1.5, applied)
+    overridden = api._chat_params({"temperature": 0.3, "max_tokens": 64}, entry)
+    ok &= check("a request override wins, the rest survives",
+                overridden["temperature"] == 0.3 and overridden["max_tokens"] == 64
+                and overridden["top_k"] == 20, overridden)
+    spoken = api._chat_params({"presence_penalty": 0.0}, entry)
+    ok &= check("request presence_penalty maps to present_penalty",
+                spoken["present_penalty"] == 0.0, spoken)
+
+    registry.delete_model("params-probe")
+    registry.save_registry(registry._empty_doc())
+    return ok
+
+
 async def case_vram_plan(pack):
     """A request must never hand llama.cpp a plan that aborts the process."""
     print("vram pre-flight")
@@ -362,22 +433,32 @@ async def case_vram_plan(pack):
     try:
         api.mm.free_memory = lambda *a, **k: []
         api.mm.get_free_memory = lambda *a, **k: int(24 * GIB)
-        guarded = api._guard_vram("clamp-me", dict(entry, free_vram=True))
-        ok &= check("guard clamps n_ctx instead of aborting",
-                    guarded["n_ctx"] == roomy.max_ctx, guarded["n_ctx"])
+        # The estimate must never resize the request: it is a static guess from
+        # GGUF metadata and overstates hybrid models several times over, so
+        # llama.cpp decides and the served context is reported afterwards.
+        guarded = api._guard_vram("try-me", dict(entry, free_vram=True))
+        ok &= check("guard leaves n_ctx alone and lets llama.cpp decide",
+                    guarded["n_ctx"] == entry["n_ctx"], guarded["n_ctx"])
 
-        api.mm.get_free_memory = lambda *a, **k: int(3 * GIB)
-        try:
-            api._guard_vram("refuse-me", dict(entry, free_vram=True))
-            ok &= check("guard refuses a plan that cannot fit", False, "no exception")
-        except api.ModelWontFit as exc:
-            ok &= check("guard refuses with actionable numbers",
-                        "cannot be loaded" in str(exc) and "VRAM" in str(exc), str(exc)[:140])
-
-        api.mm.get_free_memory = lambda *a, **k: int(24 * GIB)
         capped = dict(entry, n_ctx=262144, vram_limit=28, enforce_vram=True)
         ok &= check("vram_limit + enforce_vram is left to the loader",
                     api._guard_vram("offload-me", capped)["n_ctx"] == 262144)
+
+        # auto_fit_ctx=false restores the strict pre-estimate refusal.
+        settings = api._settings
+        api._settings = lambda: dict(settings(), auto_fit_ctx=False)
+        try:
+            api.mm.get_free_memory = lambda *a, **k: int(3 * GIB)
+            try:
+                api._guard_vram("refuse-me", dict(entry, free_vram=True))
+                ok &= check("auto_fit_ctx=false refuses instead of trying", False,
+                            "no exception")
+            except api.ModelWontFit as exc:
+                ok &= check("auto_fit_ctx=false refuses with actionable numbers",
+                            "cannot be loaded" in str(exc) and "VRAM" in str(exc),
+                            str(exc)[:140])
+        finally:
+            api._settings = settings
     finally:
         api.mm.get_free_memory, api.mm.free_memory = real_free, real_free_memory
     return ok
@@ -709,6 +790,7 @@ def main():
             asyncio.run(case_registry_editor(pack)),
             asyncio.run(case_vram_plan(pack)),
             asyncio.run(case_knobs_affect_preview(pack)),
+            asyncio.run(case_recommended_params(pack)),
             asyncio.run(case_no_reload(pack)),
             asyncio.run(case_node_register(pack)),
             asyncio.run(case_sessions(pack, tmpdir)),

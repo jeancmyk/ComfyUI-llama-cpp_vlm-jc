@@ -115,6 +115,61 @@ PARAM_KEYS = (
     "reasoning_budget",
 )
 
+# Sampling defaults, taken from each model family's own model card rather than
+# from llama.cpp's generic values (temperature 0.2 / top_k 40 / min_p 0.05),
+# which are a poor fit for a thinking model: too cold, and min_p 0.05 cuts the
+# tail Qwen's guidance keeps.
+#
+# Qwen3.5/3.6/3.8 (HF model cards, "Best Practices"):
+#   thinking, general : temperature 1.0, top_p 0.95, top_k 20, min_p 0.0,
+#                       presence_penalty 1.5, repetition_penalty 1.0
+#   thinking, coding  : temperature 0.6, same rest, presence_penalty 0.0
+#   instruct          : temperature 0.7, top_p 0.80, rest as above
+# Gemma (Google model card): temperature 1.0, top_k 64, top_p 0.95.
+_COMMON_PARAMS = {
+    "max_tokens": 2048,
+    "typical_p": 1.0,          # disabled
+    "frequency_penalty": 0.0,
+    "mirostat_mode": 0,        # off
+    "mirostat_tau": 5.0,
+    "mirostat_eta": 0.1,
+    "seed": -1,                # random
+    "stop": [],
+}
+
+_QWEN_THINKING = {
+    "temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
+    # Qwen spells it presence_penalty; llama-cpp-python calls it present_penalty.
+    "present_penalty": 1.5, "repeat_penalty": 1.0,
+}
+_QWEN_INSTRUCT = {
+    "temperature": 0.7, "top_p": 0.80, "top_k": 20, "min_p": 0.0,
+    "present_penalty": 1.5, "repeat_penalty": 1.0,
+}
+_GEMMA = {
+    "temperature": 1.0, "top_k": 64, "top_p": 0.95, "min_p": 0.0,
+    "repeat_penalty": 1.0,
+}
+
+
+def recommended_params(chat_handler):
+    """Leaves sampling values recommended by the model family's model card.
+
+    An empty result means "no opinion": the caller should keep whatever the
+    loader/llama.cpp defaults are instead of inventing values for a family we
+    have no published guidance for.
+    """
+    name = str(chat_handler or "None")
+    params = dict(_COMMON_PARAMS)
+    if name.startswith(("Qwen3.5", "Qwen3.6", "Qwen3.8", "Qwen3-VL")):
+        params.update(_QWEN_THINKING if "Thinking" in name else _QWEN_INSTRUCT)
+    elif name.startswith("Gemma"):
+        params.update(_GEMMA)
+    else:
+        return dict(_COMMON_PARAMS)
+    return params
+
+
 DEFAULT_SETTINGS = {
     # Bearer token required by every /v1 route. Empty = no authentication,
     # which is fine for the default localhost-only ComfyUI bind.
@@ -262,6 +317,8 @@ def normalize_entry(entry):
 
     params = {}
     for key, value in (entry.get("params") or {}).items():
+        if key == "presence_penalty":      # OpenAI spelling of llama.cpp's name
+            key = "present_penalty"
         if key in PARAM_KEYS and value is not None:
             params[key] = value
     clean["params"] = params

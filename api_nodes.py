@@ -259,6 +259,13 @@ class llama_cpp_api_model:
             enforce_vram = False
 
         params = self._parse_json(params_json, "params_json")
+        if not params:
+            # Empty means "use the family's own model card" rather than
+            # llama.cpp's generic temperature 0.2 / min_p 0.05, which suit a
+            # thinking model badly.
+            params = model_registry.recommended_params(chat_handler)
+            if params:
+                notes.append(f"params: applied the {chat_handler} model-card defaults")
         capabilities = self._parse_json(capabilities_json, "capabilities_json")
 
         entry = {

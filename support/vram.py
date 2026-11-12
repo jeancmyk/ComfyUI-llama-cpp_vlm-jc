@@ -116,9 +116,24 @@ def estimate_kv_cache(info, n_ctx, cache_type_k="f16", cache_type_v="f16"):
     k_elem_bytes = cache_element_bytes(cache_type_k)
     v_elem_bytes = cache_element_bytes(cache_type_v)
 
+    # Hybrid attention/SSM stacks (Qwen3-Next family and friends) are mostly
+    # recurrent blocks: llama.cpp keeps a KV cache only for the full-attention
+    # ones, one per `full_attention_interval`. Counting every block is not a
+    # safety margin, it is simply wrong - on Dark Nexus 27B it claims 72 KiB per
+    # token where the truth is ~18, which turns "262144 fits in 4.5 GiB" into
+    # "262144 needs 18 GiB and cannot fit".
+    interval = int(info.get("full_attention_interval") or 0)
+    attention_layers = None
+    if interval > 1:
+        attention_layers = {layer for layer in range(n_layer)
+                            if layer % interval == interval - 1} or None
+
     total = 0
     swa_layers = 0
     for layer in range(n_layer):
+        if attention_layers is not None and layer not in attention_layers:
+            # Recurrent block: constant state, nothing that grows with n_ctx.
+            continue
         local = bool(window) and layer < len(pattern) and bool(pattern[layer])
         if local:
             # A local layer only ever holds `window` positions, whatever n_ctx

@@ -105,6 +105,31 @@ http://127.0.0.1:8188/v1
 这些旋钮（`vram_margin`、`vram_reserve_gb`、`auto_fit_ctx`、`reasoning` 等）
 是即时的：接口在下次请求时重读文件，无需重启。
 
+### 采样默认值
+
+条目的 `params` 会在每个请求中生效（请求可覆盖），这也是思考模型能否正常
+工作的关键。留空表示"使用模型家族公开的值"——`params_json` 为空时
+**API Model** 节点会按模型卡自动填充，而 `api_models.json` 里现在每个条目
+都显式带着这些值：
+
+| 家族 | temperature | top_p | top_k | min_p | presence | repetition |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.5/3.6/3.8 思考模式（通用） | 1.0 | 0.95 | 20 | 0.0 | 1.5 | 1.0 |
+| Qwen3.5/3.6/3.8 思考模式（精确编码） | 0.6 | 0.95 | 20 | 0.0 | 0.0 | 1.0 |
+| Qwen3.5/3.6/3.8 指令 / 非思考 | 0.7 | 0.80 | 20 | 0.0 | 1.5 | 1.0 |
+| Gemma | 1.0 | 0.95 | 64 | 0.0 | - | 1.0 |
+
+所有家族还会带上 `max_tokens 2048`、`typical_p 1.0`、`frequency_penalty 0`、
+`mirostat_mode 0`、`seed -1`、`stop []`。
+
+这一点很重要：llama.cpp 自带的默认值是 `temperature 0.2`、`top_k 40`、
+`min_p 0.05`——对思考模型来说过冷，且 `min_p 0.05` 会截掉 Qwen 建议保留
+（取 `0.0`）的分布尾部。数值取自模型卡
+（[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)、
+[Qwen3-30B-A3B-Thinking](https://huggingface.co/Qwen/Qwen3-30B-A3B-Thinking-2507)）；
+Qwen 写作 `presence_penalty`，条目中可直接使用，会映射到 llama.cpp 的
+`present_penalty`。
+
 ### 在触碰 llama.cpp 之前先核对加载规划
 
 过度分配的 CUDA 显存会**中止整个 ComfyUI 进程**（`Fatal Python error`，

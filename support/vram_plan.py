@@ -76,7 +76,15 @@ class LoadPlan:
 
     @property
     def fits(self) -> bool:
-        return self.required_bytes <= self.usable_bytes
+        """True when the *requested* context itself fits the budget.
+
+        This is deliberately the same comparison the caller then acts on. It
+        used to be ``required <= free * margin``, which ignored the reserve
+        entirely and disagreed with ``max_ctx``: a plan could report "fits" for
+        a size whose KV cache left nothing for llama.cpp's compute buffers, so
+        the reserve knob did nothing and the load came up short.
+        """
+        return self.max_ctx >= self.requested_ctx
 
     @property
     def can_clamp(self) -> bool:
@@ -167,6 +175,10 @@ def plan(config, free_bytes, reserve_bytes=None, margin=None):
         max_ctx = max_context_for_budget(
             info, budget,
             config.get("cache_type_k", "f16"), config.get("cache_type_v", "f16"),
+            # Never answer with more than was asked for: the caller uses this to
+            # *lower* n_ctx, and an unbounded answer turns "clamp" into "raise
+            # the entry's context past its own request".
+            cap=n_ctx,
         )
     else:
         max_ctx = 0

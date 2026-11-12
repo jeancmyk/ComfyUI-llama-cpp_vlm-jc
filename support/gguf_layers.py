@@ -245,6 +245,10 @@ _MODEL_INFO_SUFFIXES = (
     "attention.sliding_window_pattern",
     "attention.key_length_swa",
     "attention.value_length_swa",
+    # Hybrid recurrent/attention stacks (Qwen3-Next, Qwen3.5/3.6 hybrid, ...):
+    # only one block in `full_attention_interval` keeps a KV cache, so sizing
+    # every block overstates it by exactly that factor (4x on Dark Nexus 27B).
+    "full_attention_interval",
 )
 
 
@@ -309,4 +313,10 @@ def get_model_info(path):
         "sliding_window_pattern": value("attention.sliding_window_pattern") or [],
         "key_length_swa": value("attention.key_length_swa"),
         "value_length_swa": value("attention.value_length_swa"),
+        # Hybrid attention/SSM models keep a KV cache for only one block in
+        # `full_attention_interval`; the rest are recurrent and hold a constant
+        # state. Sizing every block (as if this were 1) overstates the cache by
+        # that factor - 4x on Dark Nexus 27B - which is enough to refuse a
+        # context that fits with room to spare.
+        "full_attention_interval": _as_int(value("full_attention_interval"), 0) or 0,
     }
