@@ -1,4 +1,7 @@
 __pycache__/
+# scratch paths written by tests/test_toolcalls_integration.py
+tests/_toolcall_scratch_*/
+tests/_scratch_*.json
 checkpoints/
 *.py[cod]
 *$py.class
@@ -10,3 +13,6 @@ api_models.json
 api_sessions/
 # local backups of the above - never history
 *.bak
+*.bak-*
+# raw replies captured when LLAMA_CPP_TOOLCALLS_DEBUG=1 is set
+llama_cpp_toolcalls_debug.jsonl

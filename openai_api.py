@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import functools
+import gc
 import hashlib
 import json
 import os
@@ -55,6 +56,7 @@ import comfy.model_management as mm
 from .nodes import LLAMA_CPP_STORAGE
 from .support import backend
 from .support import model_registry
+from .support import toolcalls
 from .support import vram_plan
 from .support.reasoning import split_reasoning
 from .support.runtime import GENERATION_LOCK, LOADING
@@ -307,7 +309,32 @@ def _internalize_media(messages, session_id):
 
 
 def _signature(message):
-    return json.dumps(message.get("content"), sort_keys=True, ensure_ascii=False)
+    """History identity for replay detection, tool calls included.
+
+    Content alone is not enough once tools are in play: a stored assistant
+    turn may carry prose *or* ``None`` content plus the calls themselves, and
+    the client echoes back whichever of those it was given. Comparing the
+    (canonicalised) calls as well keeps a resent history matching what was
+    stored instead of replaying it twice.
+    """
+    calls = message.get("tool_calls")
+    if not calls:
+        return json.dumps(message.get("content"), sort_keys=True, ensure_ascii=False)
+    return json.dumps(
+        {
+            "content": message.get("content"),
+            "tool_calls": [
+                {
+                    "name": (call.get("function") or {}).get("name"),
+                    # Arguments are a JSON string on the wire but may be a
+                    # mapping once normalised; compare them the same way.
+                    "arguments": toolcalls.arguments_map(
+                        (call.get("function") or {}).get("arguments")),
+                }
+                for call in calls if isinstance(call, dict)
+            ],
+        },
+        sort_keys=True, ensure_ascii=False)
 
 
 def _history_is_prefix(history, incoming):
@@ -355,10 +382,28 @@ def _session_id(request, payload):
 # models / generation
 # --------------------------------------------------------------------------- #
 def _effective_ctx():
-    """The context the resident model was actually loaded with (post-clamp)."""
-    if LLAMA_CPP_STORAGE.llm is None:
+    """How many tokens the resident model can *actually* serve.
+
+    ``current_config["n_ctx"]`` is what the loader was asked for, which is not
+    the same thing: llama.cpp settles on its own size while it builds the
+    context (a KV cache that does not fit, speculative-decoding reservations),
+    and ``llama_n_ctx_seq()`` is the honest answer. Reporting the request to
+    clients makes them size prompts against a window that does not exist - a
+    long conversation then dies at the first turn that crosses the real limit.
+    """
+    llm = LLAMA_CPP_STORAGE.llm
+    if llm is None:
         return None
-    return int((LLAMA_CPP_STORAGE.current_config or {}).get("n_ctx") or 0)
+    try:
+        seq = getattr(llm, "n_ctx_seq", None)
+        if callable(seq):
+            return int(seq())
+    except Exception:
+        pass
+    try:
+        return int(llm.n_ctx())
+    except Exception:
+        return int((LLAMA_CPP_STORAGE.current_config or {}).get("n_ctx") or 0)
 
 
 def _loaded_model_id():
@@ -392,30 +437,95 @@ def _vram_knobs():
     return vram_plan.knobs(_settings())
 
 
-def _guard_vram(model_id, config):
-    """Check the load plan against free VRAM; clamp n_ctx or refuse.
+GIB = 1024.0 ** 3
 
-    Returns the config to load (possibly with a smaller ``n_ctx``). Raises
-    :class:`ModelWontFit` when no context size can work.
+
+def _evict_everything(device):
+    """Hand llama.cpp every byte ComfyUI can give back."""
+    try:
+        mm.unload_all_models()
+    except Exception as exc:
+        print(f"[llama-cpp_vlm/api] could not unload ComfyUI models: {exc}")
+    gc.collect()
+    try:
+        mm.soft_empty_cache()
+    except Exception as exc:
+        print(f"[llama-cpp_vlm/api] could not empty the CUDA cache: {exc}")
+
+
+def _free_for_load(model_id, config, knobs, device):
+    """Ask ComfyUI to free the whole footprint of the requested context.
+
+    ``LoadPlan.required_bytes`` deliberately leaves the reserve out, because the
+    reserve is a safety knob subtracted from the budget rather than part of the
+    model. An eviction request must not copy that: it has to cover everything
+    llama.cpp is about to allocate, or ComfyUI keeps a model resident and stops
+    freeing at "just enough for the plan".
+
+    The ask is divided by the margin as well, because the plan compares against
+    ``free * margin``: freeing exactly the requirement leaves the plan failing
+    its own check and clamps a context that would have fitted.
+
+    This only *asks*; escalating to unloading everything is decided in
+    :func:`_guard_vram`, where the actual fit is known. Asking for the whole
+    footprint routinely exceeds a card's free VRAM even when the context fits,
+    so escalating here would evict ComfyUI's models for no gain.
+    """
+    required = int(vram_plan.plan(config, 0).required_bytes)
+    margin = max(0.5, float(knobs.get("margin") or 1.0))
+    want = int(required / margin) + int(knobs["reserve_bytes"])
+    mm.free_memory(want, device)
+    mm.soft_empty_cache()
+    return int(mm.get_free_memory(device))
+
+
+def _guard_vram(model_id, config):
+    """Make room for the load, then report the plan without resizing it.
+
+    Eviction is real work: the request asks ComfyUI for the whole footprint and,
+    if that is still short, unloads every model it holds. The *context size* is
+    not touched - see the note at the end of the function for why the estimate
+    must not be trusted with that decision.
+
+    Returns the config to load. Raises :class:`ModelWontFit` only when
+    ``auto_fit_ctx`` is off and the plan says it cannot fit.
     """
     device = mm.get_torch_device()
     config = dict(config)
+    knobs = _vram_knobs()
+    evict = bool(config.get("free_vram", True))
 
     try:
-        if config.get("free_vram", True):
-            # Ask ComfyUI to unload only as much as this load needs, so an idle
-            # diffusion model survives when there is already room.
-            need = vram_plan.plan(config, 0).required_bytes
-            mm.free_memory(need, device)
-            mm.soft_empty_cache()
-        free = mm.get_free_memory(device)
+        if evict:
+            free = _free_for_load(model_id, config, knobs, device)
+        else:
+            free = int(mm.get_free_memory(device))
     except Exception as exc:
         print(f"[llama-cpp_vlm/api] VRAM pre-flight skipped ({exc})")
         return config
 
-    knobs = _vram_knobs()
     planned = vram_plan.plan(config, free,
                              reserve_bytes=knobs["reserve_bytes"], margin=knobs["margin"])
+
+    if not planned.fits and evict:
+        # ComfyUI is still holding models the requested context needs. Its own
+        # models are the only thing it can hand back, and giving up context is
+        # the last resort rather than the first - so take everything and decide
+        # again before clamping.
+        print(f"[llama-cpp_vlm/api] {model_id!r}: {planned.describe()}")
+        print(f"[llama-cpp_vlm/api] {model_id!r}: unloading every ComfyUI model "
+              "to make room")
+        _evict_everything(device)
+        freed = int(mm.get_free_memory(device))
+        if freed > free:
+            free = freed
+            planned = vram_plan.plan(config, free,
+                                     reserve_bytes=knobs["reserve_bytes"],
+                                     margin=knobs["margin"])
+            print(f"[llama-cpp_vlm/api] {model_id!r}: {free / GIB:.1f} GB free "
+                  f"after eviction (requested context "
+                  f"{'fits' if planned.fits else 'still does not fit'})")
+
     if planned.fits:
         return config
 
@@ -426,12 +536,20 @@ def _guard_vram(model_id, config):
               "enforce_vram will offload layers")
         return config
 
-    auto_fit = _settings().get("auto_fit_ctx", True)
-    if auto_fit and planned.can_clamp:
+    # The plan is a static guess from GGUF metadata, and it is wrong often
+    # enough to be dangerous the other way round: hybrid models keep a KV cache
+    # for only some blocks (Dark Nexus: `full_attention_interval = 4`, so 16 of
+    # 64), which makes the estimator overstate the cache several times over and
+    # refuse context that fits comfortably. llama.cpp knows the real geometry,
+    # and when a cache does not fit it builds the largest one that does and
+    # reports it through n_ctx_seq(). So: load what the entry asked for and say
+    # what actually came up - the same thing the loader node does, instead of
+    # silently serving a shrunken context nobody asked for.
+    if _settings().get("auto_fit_ctx", True):
         print(f"[llama-cpp_vlm/api] {model_id!r}: {planned.describe()}")
-        print(f"[llama-cpp_vlm/api] {model_id!r}: clamping n_ctx "
-              f"{planned.requested_ctx} -> {planned.max_ctx} so the load fits")
-        config["n_ctx"] = planned.max_ctx
+        print(f"[llama-cpp_vlm/api] {model_id!r}: loading anyway at n_ctx="
+              f"{planned.requested_ctx} - that estimate is a static guess, so "
+              "llama.cpp gets to decide; the served context is reported after")
         return config
 
     raise ModelWontFit(vram_plan.refusal(planned, model_id))
@@ -440,11 +558,9 @@ def _guard_vram(model_id, config):
 def _is_resident(model_id, requested):
     """True when this endpoint already holds what the entry asks for.
 
-    The clamp applied by :func:`_guard_vram` means the resident ``n_ctx`` may
-    differ from the registry's. Comparing the entry against the *resident* config
-    would therefore look like a change on every request and reload a 20 GB model
-    per message; comparing the entry against what the entry asked for last time
-    reloads only when the entry (or the graph) actually changed something.
+    Compares the entry against what it asked for last time (not against the
+    resident config), so an entry or graph change reloads while an unchanged
+    one does not reload a 20 GB model on every message.
     """
     if LLAMA_CPP_STORAGE.llm is None:
         return False
@@ -467,19 +583,61 @@ def _load_for_model(model_id, entry):
         LLAMA_CPP_STORAGE.clean()
     if LLAMA_CPP_STORAGE.llm is None:
         config = _guard_vram(model_id, config)
-        print(f"[llama-cpp_vlm/api] loading {model_id!r} ({config.get('model')}, "
-              f"n_ctx={config.get('n_ctx')})")
-        LOADING.flag = True
-        try:
-            LLAMA_CPP_STORAGE.load_model(config)
-        finally:
-            LOADING.flag = False
-        if LLAMA_CPP_STORAGE.llm is None:
-            raise RuntimeError(f"model {model_id!r} failed to load")
+        asked = int(config.get("n_ctx") or 0)
+        evict = bool(config.get("free_vram", True))
+        for attempt in (1, 2):
+            print(f"[llama-cpp_vlm/api] loading {model_id!r} ({config.get('model')}, "
+                  f"n_ctx={config.get('n_ctx')})")
+            LOADING.flag = True
+            try:
+                LLAMA_CPP_STORAGE.load_model(config)
+            finally:
+                LOADING.flag = False
+            if LLAMA_CPP_STORAGE.llm is None:
+                raise RuntimeError(f"model {model_id!r} failed to load")
+
+            served = _effective_ctx() or 0
+            if served and asked and served < asked and attempt == 1 and evict:
+                # llama.cpp silently built what fit instead of what we asked
+                # for. Take every byte ComfyUI can hand back and try once more:
+                # a smaller context is a working-but-wrong answer, and the entry
+                # explicitly asked for this size.
+                print(f"[llama-cpp_vlm/api] {model_id!r}: context came up "
+                      f"{served} of {asked}; unloading every ComfyUI model and "
+                      "retrying")
+                LLAMA_CPP_STORAGE.clean(all=True)
+                _evict_everything(mm.get_torch_device())
+                continue
+            break
+
         _LOADED["model_id"] = model_id
         _LOADED["requested"] = requested
         _LOADED["effective"] = dict(LLAMA_CPP_STORAGE.current_config or {})
+        _report_ctx_shortfall(model_id, int(requested.get("n_ctx") or 0), asked,
+                              _effective_ctx() or 0)
     return LLAMA_CPP_STORAGE.llm
+
+
+def _report_ctx_shortfall(model_id, requested, planned, served):
+    """Say so when llama.cpp built less context than the pre-flight planned.
+
+    Only a *loss* is worth a warning. llama.cpp may also round the planned size
+    up (101475 planned, 101632 built), and the planned size may itself already be
+    below the entry's request because the pre-flight lowered it to fit - that is
+    deliberate, is announced by :func:`_guard_vram`, and shows up as
+    ``context_clamped`` in ``/v1/models``. Warning about either would be noise
+    for a context that is exactly what the client is being told.
+    """
+    if not served or not planned or served >= planned:
+        return
+    detail = ""
+    if requested and requested != planned:
+        detail = (f" (the entry asks for {requested}, which the pre-flight had "
+                  f"already lowered to {planned} to fit)")
+    print(f"[llama-cpp_vlm/api] WARNING {model_id!r}: llama.cpp built {served} "
+          f"tokens of context where {planned} was planned{detail}. Clients are "
+          f"told {served}. Free VRAM, lower n_ctx, or shrink the KV cache "
+          "(cache_type_k/v) to close the gap.")
 
 
 def _check_modalities(model_id, messages, entry):
@@ -529,6 +687,41 @@ def _chat_params(payload, entry):
     # would raise TypeError inside the native call and fail the request; drop it
     # with a console note instead.
     return backend.filter_completion_kwargs(params, "api-chat")
+
+
+def _debug_dump(kind, text):
+    """Append a raw reply to ``llama_cpp_toolcalls_debug.jsonl`` when asked to.
+
+    A call that reaches the client with the wrong arguments can come from the
+    model, from the reasoning splitter, or from the call parser; the only way to
+    tell them apart is the exact text the backend produced. Enabled with
+    ``LLAMA_CPP_TOOLCALLS_DEBUG=1`` so it costs nothing by default.
+    """
+    value = (os.environ.get("LLAMA_CPP_TOOLCALLS_DEBUG") or "").strip().strip("\"'").lower()
+    if value not in ("1", "true", "yes"):
+        return
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "llama_cpp_toolcalls_debug.jsonl")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"kind": kind, "time": int(time.time()),
+                                     "text": text}, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(f"[llama-cpp_vlm/api] could not write debug dump: {exc}")
+
+
+def _raw_call_excerpt(text, limit=400):
+    """The part of a reply that held a broken call, for the log.
+
+    Only the ``<tool_call>`` block matters when a call arrives without its
+    arguments: it shows which dialect the model used and where it went wrong.
+    """
+    if not isinstance(text, str):
+        return "<none>"
+    marker = text.find("<tool_call>")
+    excerpt = text[marker:] if marker >= 0 else text
+    excerpt = excerpt.replace("\n", "\\n")
+    return excerpt[:limit] + ("..." if len(excerpt) > limit else "")
 
 
 def _chunk_usage(chunk):
@@ -621,6 +814,10 @@ class _ReasoningStream:
         return self._drain(final=False)
 
     def flush(self):
+        # Mirrors feed()'s early return: with no spec (or "keep") nothing was
+        # ever buffered, so there is nothing to drain.
+        if self.spec is None or self.mode == "keep":
+            return []
         return self._drain(final=True)
 
     def _drain(self, final):
@@ -756,6 +953,9 @@ async def chat_completions(request):
 
     merged, replayed = _merge_history(session, messages) if session else (list(messages), 0)
     params = _chat_params(payload, entry)
+    # The XML chat templates iterate function arguments as a mapping, so the
+    # OpenAI wire format (a JSON string) has to be deserialized first.
+    generation = toolcalls.normalize_messages(merged)
     stream = bool(payload.get("stream"))
     reasoning = _reasoning_mode(payload)
     include_reasoning = payload.get("include_reasoning", True) is not False
@@ -766,13 +966,13 @@ async def chat_completions(request):
           f"session={session_id or '-'}")
 
     if stream:
-        return await _stream_chat(request, model_id, entry, merged, params,
+        return await _stream_chat(request, model_id, entry, generation, params,
                                   session_id, session, response_id, reasoning, include_reasoning)
 
     loop = asyncio.get_running_loop()
     try:
         result, spec = await loop.run_in_executor(
-            None, functools.partial(_run_chat, model_id, entry, merged, params))
+            None, functools.partial(_run_chat, model_id, entry, generation, params))
     except ModelWontFit as exc:
         return _error(400, str(exc), "model_wont_fit")
     except ValueError as exc:
@@ -785,15 +985,31 @@ async def chat_completions(request):
     result["model"] = model_id
     result["id"] = response_id
 
-    message = result["choices"][0]["message"]
+    choice = result["choices"][0]
+    message = choice["message"]
     answer = _shape_message(message, spec, reasoning)
+    _debug_dump("blocking", message.get("content"))
+
+    # The XML chat template asks the model for the call in the text, so lift it
+    # into tool_calls or the client never sees a call at all.
+    prose, calls = toolcalls.split_content(message.get("content"), params.get("tools"))
+    if calls:
+        problems = toolcalls.missing_required(calls, params.get("tools"))
+        if problems:
+            print(f"[llama-cpp_vlm/api] tool call incomplete: {'; '.join(problems)} "
+                  f"- raw text: {_raw_call_excerpt(message.get('content'))}")
+        message["content"] = prose
+        message["tool_calls"] = calls
+        choice["finish_reason"] = "tool_calls"
+        answer = prose
 
     if session_id and payload.get("store", True) is not False:
         try:
+            stored = {"role": "assistant", "content": answer}
+            if calls:
+                stored["tool_calls"] = calls
             _write_session(session or {"id": session_id, "created_at": int(time.time())},
-                           model_id,
-                           merged + [{"role": "assistant", "content": answer}],
-                           result.get("usage"))
+                           model_id, merged + [stored], result.get("usage"))
         except Exception as exc:
             print(f"[llama-cpp_vlm/api] could not save session {session_id!r}: {exc}")
 
@@ -833,7 +1049,47 @@ async def _stream_chat(request, model_id, entry, messages, params, session_id, s
                 llm = _load_for_model(model_id, entry)
                 splitter = _ReasoningStream(LLAMA_CPP_STORAGE.reasoning_spec,
                                             reasoning_mode, include_reasoning)
+                # The XML chat template asks for the call in the text; this
+                # routes each <tool_call> block into its own tool_calls delta.
+                toolsplit = toolcalls.ContentToolSplitter(params.get("tools"))
+                raw_text = []
                 emitted_role = False
+
+                def emit(delta):
+                    nonlocal emitted_role
+                    if not emitted_role:
+                        emitted_role = True
+                        loop.call_soon_threadsafe(
+                            queue.put_nowait, ("sse", chunk_event({"role": "assistant"})))
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait, ("sse", chunk_event(delta)))
+
+                def push_calls(pieces):
+                    """Answer text on to the wire, call blocks as tool_calls."""
+                    for channel, piece in pieces:
+                        if channel == "tool_call":
+                            index, call = piece
+                            emit({"tool_calls": [{
+                                "index": index,
+                                "id": call["id"],
+                                "type": "function",
+                                "function": call["function"],
+                            }]})
+                        else:
+                            emit({"content": piece})
+
+                def push(pieces):
+                    """Everything the reasoning splitter releases."""
+                    for channel, piece in pieces:
+                        if channel == "content":
+                            # Only answer text can hold a call block; reasoning
+                            # is the model talking to itself. The raw piece is
+                            # kept in case a call comes back without arguments.
+                            raw_text.append(piece)
+                            push_calls(toolsplit.feed(piece))
+                        else:
+                            emit({"reasoning_content": piece})
+
                 for chunk in llm.create_chat_completion(messages=messages, stream=True, **params):
                     if cancel.is_set():
                         break
@@ -844,23 +1100,26 @@ async def _stream_chat(request, model_id, entry, messages, params, session_id, s
                     if found:
                         usage = found
 
-                    text = (choice.get("delta") or {}).get("content") or ""
+                    delta = choice.get("delta") or {}
+                    if delta.get("tool_calls"):
+                        # A backend that parses its own calls: pass them through.
+                        emit({"tool_calls": delta["tool_calls"]})
+                    text = delta.get("content") or ""
                     if not text:
                         continue
-                    if not emitted_role:
-                        emitted_role = True
-                        loop.call_soon_threadsafe(
-                            queue.put_nowait, ("sse", chunk_event({"role": "assistant"})))
 
-                    for channel, piece in splitter.feed(text):
-                        field = "content" if channel == "content" else "reasoning_content"
-                        loop.call_soon_threadsafe(
-                            queue.put_nowait, ("sse", chunk_event({field: piece})))
+                    push(splitter.feed(text))
 
-                for channel, piece in splitter.flush():
-                    field = "content" if channel == "content" else "reasoning_content"
-                    loop.call_soon_threadsafe(
-                        queue.put_nowait, ("sse", chunk_event({field: piece})))
+                push(splitter.flush())
+                push_calls(toolsplit.flush())
+                _debug_dump("stream", "".join(raw_text))
+
+                if toolsplit.calls:
+                    finish_reason = "tool_calls"
+                    problems = toolcalls.missing_required(toolsplit.calls, params.get("tools"))
+                    if problems:
+                        print(f"[llama-cpp_vlm/api] tool call incomplete: {'; '.join(problems)} "
+                              f"- raw text: {_raw_call_excerpt(''.join(raw_text))}")
 
                 loop.call_soon_threadsafe(queue.put_nowait, ("sse", chunk_event(
                     {}, finish_reason or "stop")))
@@ -872,7 +1131,8 @@ async def _stream_chat(request, model_id, entry, messages, params, session_id, s
                     }))
                 loop.call_soon_threadsafe(
                     queue.put_nowait,
-                    ("done", {"text": "".join(splitter.content_text), "usage": usage}))
+                    ("done", {"text": "".join(splitter.content_text), "usage": usage,
+                              "tool_calls": toolsplit.calls}))
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, ("error", f"{type(exc).__name__}: {exc}"))
 
@@ -899,12 +1159,17 @@ async def _stream_chat(request, model_id, entry, messages, params, session_id, s
             elif kind == "done":
                 text = value.get("text") or ""
                 usage = value.get("usage")
+                calls = value.get("tool_calls") or []
                 if session_id:
                     try:
+                        stored = {"role": "assistant",
+                                  "content": (text or None) if calls else text}
+                        if calls:
+                            stored["tool_calls"] = calls
                         _write_session(session or {"id": session_id,
                                                    "created_at": int(time.time())},
                                        model_id,
-                                       messages + [{"role": "assistant", "content": text}],
+                                       messages + [stored],
                                        usage)
                     except Exception as exc:
                         print(f"[llama-cpp_vlm/api] could not save session {session_id!r}: {exc}")
